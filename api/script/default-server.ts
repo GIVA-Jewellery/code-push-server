@@ -3,6 +3,7 @@
 
 import * as api from "./api";
 import { AzureStorage } from "./storage/azure-storage";
+import { GCSStorage } from "./storage/gcs-storage";
 import { fileUploadMiddleware } from "./file-upload-manager";
 import { JsonStorage } from "./storage/json-storage";
 import { RedisManager } from "./redis-manager";
@@ -43,19 +44,38 @@ export function start(done: (err?: any, server?: express.Express, storage?: Stor
     .then(async () => {
       if (useJsonStorage) {
         storage = new JsonStorage();
-      } else if (!process.env.AZURE_KEYVAULT_ACCOUNT) {
-        storage = new AzureStorage();
       } else {
-        isKeyVaultConfigured = true;
+        const storageProvider = process.env.STORAGE_PROVIDER || "azure";
+        
+        switch (storageProvider.toLowerCase()) {
+          case "gcs":
+          case "google":
+            console.log("Using Google Cloud Storage");
+            storage = new GCSStorage(
+              process.env.GOOGLE_CLOUD_PROJECT_ID,
+              process.env.GOOGLE_CLOUD_KEY_FILE,
+              process.env.GOOGLE_CLOUD_STORAGE_BUCKET
+            );
+            break;
+          case "azure":
+          default:
+            console.log("Using Azure Storage");
+            if (!process.env.AZURE_KEYVAULT_ACCOUNT) {
+              storage = new AzureStorage();
+            } else {
+              isKeyVaultConfigured = true;
 
-        const credential = new DefaultAzureCredential();
+              const credential = new DefaultAzureCredential();
 
-        const vaultName = process.env.AZURE_KEYVAULT_ACCOUNT;
-        const url = `https://${vaultName}.vault.azure.net`;
+              const vaultName = process.env.AZURE_KEYVAULT_ACCOUNT;
+              const url = `https://${vaultName}.vault.azure.net`;
 
-        const keyvaultClient = new SecretClient(url, credential);
-        const secret = await keyvaultClient.getSecret(`storage-${process.env.AZURE_STORAGE_ACCOUNT}`);
-        storage = new AzureStorage(process.env.AZURE_STORAGE_ACCOUNT, secret);
+              const keyvaultClient = new SecretClient(url, credential);
+              const secret = await keyvaultClient.getSecret(`storage-${process.env.AZURE_STORAGE_ACCOUNT}`);
+              storage = new AzureStorage(process.env.AZURE_STORAGE_ACCOUNT, secret);
+            }
+            break;
+        }
       }
     })
     .then(() => {
@@ -165,7 +185,7 @@ export function start(done: (err?: any, server?: express.Express, storage?: Stor
       // Error handler needs to be the last middleware so that it can catch all unhandled exceptions
       app.use(appInsights.errorHandler);
 
-      if (isKeyVaultConfigured) {
+      if (isKeyVaultConfigured && storage instanceof AzureStorage) {
         // Refresh credentials from the vault regularly as the key is rotated
         setInterval(() => {
           keyvaultClient

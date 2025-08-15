@@ -8,6 +8,8 @@ For convenience, we will also load the server environment from any '.env' file i
 
 ### Storage
 
+- `STORAGE_PROVIDER`: Choose between 'azure' (default) or 'gcs' for Google Cloud Storage
+
 #### Local
 
 To emulate Azure Blob Storage locally. Azurite needs to be installed and running, more info [here](README.md#local).
@@ -16,6 +18,11 @@ To emulate Azure Blob Storage locally. Azurite needs to be installed and running
 #### Azure
 - `AZURE_STORAGE_ACCOUNT`: The name of your hosted Azure storage instance
 - `AZURE_STORAGE_ACCESS_KEY`: The key to your Azure storage instance (if KeyVault credentials are not provided)
+
+#### Google Cloud Storage
+- `GOOGLE_CLOUD_PROJECT_ID`: Your Google Cloud Project ID
+- `GOOGLE_CLOUD_KEY_FILE`: Path to your service account key file (optional if using default credentials)
+- `GOOGLE_CLOUD_STORAGE_BUCKET`: Name of the GCS bucket to use (default: code-push-server)
 
 ### Authentication 
 
