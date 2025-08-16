@@ -46,6 +46,8 @@ JsonStorage.json
 *.key
 *.cnf
 
+avnimetabase-*.json
+
 # Azurite local storage files
 __azurite_db_*
 __blobstorage__

@@ -24,6 +24,8 @@ To emulate Azure Blob Storage locally. Azurite needs to be installed and running
 - `GOOGLE_CLOUD_KEY_FILE`: Path to your service account key file (optional if using default credentials)
 - `GOOGLE_CLOUD_STORAGE_BUCKET`: Name of the GCS bucket to use (default: code-push-server)
 
+**Note**: The GCS bucket should be kept private. The implementation uses signed URLs for secure access to blobs with 1-hour expiration times.
+
 ### Authentication 
 
 - `SERVER_URL`: The URL of your server, for local deployment it will be either http://localhost:3000 or https://localhost:8443. For Azure it will be your Azure App URL

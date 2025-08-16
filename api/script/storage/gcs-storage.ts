@@ -176,14 +176,29 @@ export class GCSStorage implements storage.Storage {
               .get()
               .then((doc) => {
                 if (!doc.exists || doc.data()?.health !== "health") {
-                  docReject(
-                    storage.storageError(storage.ErrorCode.ConnectionFailed, "The Firestore service failed the health check")
-                  );
+                  // Try to create the health document if it doesn't exist
+                  return this._firestore
+                    .collection(GCSStorage.COLLECTION_NAME)
+                    .doc("health")
+                    .set({ health: "health" })
+                    .then(() => docResolve())
+                    .catch(docReject);
                 } else {
                   docResolve();
                 }
               })
-              .catch(docReject);
+              .catch((error) => {
+                // If collection doesn't exist, try to create the health document
+                if (error.code === 5 || error.code === "not-found") {
+                  return this._firestore
+                    .collection(GCSStorage.COLLECTION_NAME)
+                    .doc("health")
+                    .set({ health: "health" })
+                    .then(() => docResolve())
+                    .catch(docReject);
+                }
+                docReject(error);
+              });
           });
 
           const acquisitionBlobCheck: q.Promise<void> = this.blobHealthCheck(this._bucket);
@@ -696,7 +711,15 @@ export class GCSStorage implements storage.Storage {
   public getBlobUrl(blobId: string): q.Promise<string> {
     return this._setupPromise
       .then(() => {
-        return `gs://${this._bucket.name}/${blobId}`;
+        const file = this._bucket.file(blobId);
+        // Generate a signed URL that expires in 1 hour
+        return file.getSignedUrl({
+          action: 'read',
+          expires: Date.now() + 60 * 60 * 1000, // 1 hour
+        });
+      })
+      .then((signedUrls) => {
+        return signedUrls[0];
       })
       .catch(GCSStorage.gcsErrorHandler);
   }
@@ -852,6 +875,7 @@ export class GCSStorage implements storage.Storage {
       options.keyFilename = _keyFilename;
     }
 
+    options.databaseId = process.env.GOOGLE_CLOUD_FIRESTORE_DATABASE || "(default)";
     this._firestore = new Firestore(options);
     this._storage = new CloudStorage(options);
     this._bucket = this._storage.bucket(_bucketName);
@@ -1161,17 +1185,24 @@ export class GCSStorage implements storage.Storage {
       .where("partitionKey", "==", partitionKey)
       .get();
 
-    if (querySnapshot.empty) {
-      throw new Error("Entity not found");
-    }
-
     const objects: any[] = [];
+    let foundParent = false;
+    
     querySnapshot.forEach((doc) => {
       const data = doc.data();
-      if (data.rowKey !== rowKey) {
+      if (data.rowKey === rowKey) {
+        foundParent = true;
+      } else {
         objects.push(this.unwrap(data));
       }
     });
+
+    // Only throw error if we can't find the parent entity (account/app doesn't exist)
+    // but allow empty collections (no apps for account, no deployments for app)
+    if (!foundParent && objects.length === 0 && !appId) {
+      // For account queries, we need the account to exist
+      throw new Error("Entity not found");
+    }
 
     return objects;
   }
