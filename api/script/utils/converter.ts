@@ -94,14 +94,19 @@ export function toRestAccount(storageAccount: Storage.Account): Account {
 export function sortAndUpdateDisplayNameOfRestAppsList(apps: App[]): App[] {
   const nameToCountMap: { [name: string]: number } = {};
   apps.forEach((app: App) => {
-    nameToCountMap[app.name] = nameToCountMap[app.name] || 0;
-    nameToCountMap[app.name]++;
+    if (app && app.name) {
+      nameToCountMap[app.name] = nameToCountMap[app.name] || 0;
+      nameToCountMap[app.name]++;
+    }
   });
 
   return apps
+    .filter((app: App) => app && app.name) // Filter out apps with undefined/null names
     .sort((first: App, second: App) => {
       // Sort by raw name instead of display name
-      return first.name.localeCompare(second.name);
+      const firstName = first.name || '';
+      const secondName = second.name || '';
+      return firstName.localeCompare(secondName);
     })
     .map((app: App) => {
       const storageApp = toStorageApp(app, 0);

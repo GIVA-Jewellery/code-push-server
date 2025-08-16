@@ -1179,8 +1179,33 @@ export function getManagementRouter(config: ManagementConfig): Router {
     }
   );
 
-  function invalidateCachedPackage(deploymentKey: string): Q.Promise<void> {
-    return redisManager.invalidateCache(redis.Utilities.getDeploymentKeyHash(deploymentKey));
+  function invalidateCachedPackage(deploymentKey: string): q.Promise<void> {
+    console.log(`[DEBUG] invalidateCachedPackage - key: ${deploymentKey}`);
+    const hash: string = `deploymentKey:${deploymentKey}`;
+    console.log(`[DEBUG] invalidateCachedPackage - hash: ${hash}`);
+    
+    // Add timeout to prevent hanging
+    const timeoutPromise = q.delay(5000).then(() => {
+      console.log(`[DEBUG] invalidateCachedPackage - timeout reached for key: ${deploymentKey}`);
+      throw new Error(`Cache invalidation timeout for key: ${deploymentKey}`);
+    });
+    
+    const invalidationPromise = redisManager.invalidateCache(hash)
+      .then(() => {
+        console.log(`[DEBUG] invalidateCachedPackage - completed for key: ${deploymentKey}`);
+      })
+      .catch((error) => {
+        console.log(`[DEBUG] invalidateCachedPackage - error for key: ${deploymentKey}`, error);
+        // Don't throw error to prevent deletion from failing
+        return q.resolve();
+      });
+    
+    return q.race([invalidationPromise, timeoutPromise])
+      .catch((error) => {
+        console.log(`[DEBUG] invalidateCachedPackage - race error for key: ${deploymentKey}`, error);
+        // Don't throw error to prevent deletion from failing
+        return q.resolve();
+      });
   }
 
   function throwIfInvalidPermissions(app: storageTypes.App, requiredPermission: string): boolean {

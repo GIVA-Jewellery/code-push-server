@@ -339,11 +339,34 @@ export class GCSStorage implements storage.Storage {
         return this.getCollectionByHierarchy(accountId);
       })
       .then((flatApps: any[]) => {
-        const apps: storage.App[] = flatApps.map((flatApp: any) => {
-          return GCSStorage.unflattenApp(flatApp, accountId);
+        // Filter to only process app pointers (objects with partitionKeyPointer and rowKeyPointer)
+        const appPointers = flatApps.filter((item: any) => 
+          item && item.partitionKeyPointer && item.rowKeyPointer &&
+          item.partitionKeyPointer.startsWith('appId ')
+        );
+        
+        console.log(`[DEBUG] getApps - filtered ${appPointers.length} app pointers from ${flatApps.length} total objects`);
+        
+        // Resolve each pointer to get the actual app document
+        const appPromises = appPointers.map((pointer: any) => {
+          const partitionKey = pointer.partitionKeyPointer;
+          const rowKey = pointer.rowKeyPointer;
+          console.log(`[DEBUG] Resolving pointer: ${partitionKey} / ${rowKey}`);
+          return this.retrieveByKey(partitionKey, rowKey)
+            .then((flatApp: any) => {
+              console.log(`[DEBUG] Retrieved app:`, flatApp);
+              return GCSStorage.unflattenApp(flatApp, accountId);
+            })
+            .catch((error: any) => {
+              console.log(`[DEBUG] Failed to resolve pointer ${partitionKey}: ${error.message}`);
+              return null; // Return null for failed retrievals
+            });
         });
 
-        return apps;
+        return q.all(appPromises).then((apps: (storage.App | null)[]) => {
+          // Filter out null values (failed retrievals)
+          return apps.filter((app: storage.App | null) => app !== null) as storage.App[];
+        });
       })
       .catch(GCSStorage.gcsErrorHandler);
   }
@@ -360,14 +383,23 @@ export class GCSStorage implements storage.Storage {
   }
 
   public removeApp(accountId: string, appId: string): q.Promise<void> {
+    console.log(`[DEBUG] removeApp - starting removal of appId: ${appId}, accountId: ${accountId}`);
     return this._setupPromise
       .then(() => {
+        console.log(`[DEBUG] removeApp - calling removeAllCollaboratorsAppPointers`);
         return this.removeAllCollaboratorsAppPointers(accountId, appId);
       })
       .then(() => {
+        console.log(`[DEBUG] removeApp - calling cleanUpByAppHierarchy`);
         return this.cleanUpByAppHierarchy(appId);
       })
-      .catch(GCSStorage.gcsErrorHandler);
+      .then(() => {
+        console.log(`[DEBUG] removeApp - completed successfully`);
+      })
+      .catch((error: any) => {
+        console.error(`[ERROR] removeApp - failed:`, error);
+        throw error;
+      });
   }
 
   public updateApp(accountId: string, app: storage.App): q.Promise<void> {
@@ -1028,15 +1060,22 @@ export class GCSStorage implements storage.Storage {
     const accountPartitionKey: string = Keys.getAccountPartitionKey(accountId);
     const accountRowKey: string = Keys.getHierarchicalAccountRowKey(accountId, appId);
 
+    console.log(`[DEBUG] Creating app pointer: accountId=${accountId}, appId=${appId}`);
+    console.log(`[DEBUG] Account partition key: ${accountPartitionKey}`);
+    console.log(`[DEBUG] Account row key: ${accountRowKey}`);
+    console.log(`[DEBUG] Pointer:`, pointer);
+
     const docRef = this._firestore
       .collection(GCSStorage.COLLECTION_NAME)
       .doc(this.getDocumentId(accountPartitionKey, accountRowKey));
     docRef
       .set(this.wrap(pointer, accountPartitionKey, accountRowKey))
       .then(() => {
+        console.log(`[DEBUG] App pointer created successfully`);
         deferred.resolve();
       })
       .catch((error: any) => {
+        console.error(`[ERROR] Failed to create app pointer:`, error);
         deferred.reject(error);
       });
 
@@ -1180,22 +1219,33 @@ export class GCSStorage implements storage.Storage {
       rowKey = Keys.getHierarchicalAccountRowKey(accountId);
     }
 
+    console.log(`[DEBUG] Query - accountId: ${accountId}, appId: ${appId}, deploymentId: ${deploymentId}`);
+    console.log(`[DEBUG] Query - partitionKey: ${partitionKey}`);
+    console.log(`[DEBUG] Query - rowKey: ${rowKey}`);
+
     const querySnapshot = await this._firestore
       .collection(GCSStorage.COLLECTION_NAME)
       .where("partitionKey", "==", partitionKey)
       .get();
+
+    console.log(`[DEBUG] Query - found ${querySnapshot.docs.length} documents`);
 
     const objects: any[] = [];
     let foundParent = false;
     
     querySnapshot.forEach((doc) => {
       const data = doc.data();
+      console.log(`[DEBUG] Doc - id: ${doc.id}, partitionKey: ${data.partitionKey}, rowKey: ${data.rowKey}`);
       if (data.rowKey === rowKey) {
         foundParent = true;
+        console.log(`[DEBUG] Found parent entity`);
       } else {
+        console.log(`[DEBUG] Adding to objects:`, this.unwrap(data));
         objects.push(this.unwrap(data));
       }
     });
+
+    console.log(`[DEBUG] Result - foundParent: ${foundParent}, objects.length: ${objects.length}`);
 
     // Only throw error if we can't find the parent entity (account/app doesn't exist)
     // but allow empty collections (no apps for account, no deployments for app)
