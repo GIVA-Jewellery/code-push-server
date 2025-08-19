@@ -513,7 +513,7 @@ export class JsonStorage implements storage.Storage {
 
   public updatePackageHistory(accountId: string, appId: string, deploymentId: string, history: storage.Package[]): Promise<void> {
     if (!history || !history.length) {
-      return JsonStorage.getRejectedPromise(storage.ErrorCode.Invalid, "Cannot clear package history from an update operation");
+      return JsonStorage.getRejectedPromise(storage.ErrorCode.Other, "Cannot clear package history from an update operation");
     }
 
     const deployment: any = <any>this.deployments[deploymentId];

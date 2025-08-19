@@ -677,7 +677,7 @@ export class AzureStorage implements storage.Storage {
   public updatePackageHistory(accountId: string, appId: string, deploymentId: string, history: storage.Package[]): q.Promise<void> {
     // If history is null or empty array we do not update the package history, use clearPackageHistory for that.
     if (!history || !history.length) {
-      throw storage.storageError(storage.ErrorCode.Invalid, "Cannot clear package history from an update operation");
+      throw storage.storageError(storage.ErrorCode.Other, "Cannot clear package history from an update operation");
     }
 
     return this._setupPromise

@@ -3,7 +3,7 @@
 
 import * as api from "./api";
 import { AzureStorage } from "./storage/azure-storage";
-import { GCSStorage } from "./storage/gcs-storage";
+import { GCSStorage } from "./storage/gcp-storage";
 import { fileUploadMiddleware } from "./file-upload-manager";
 import { JsonStorage } from "./storage/json-storage";
 import { RedisManager } from "./redis-manager";

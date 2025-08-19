@@ -6,6 +6,7 @@ import * as shortid from "shortid";
 import * as q from "q";
 
 import { AzureStorage } from "../script/storage/azure-storage";
+import { GCSStorage } from "../script/storage/gcp-storage";
 import { JsonStorage } from "../script/storage/json-storage";
 import * as storageTypes from "../script/storage/storage";
 import * as utils from "./utils";
@@ -18,12 +19,19 @@ if (process.env.TEST_AZURE_STORAGE) {
   describe("Azure Storage", () => storageTests(AzureStorage));
 }
 
+if (process.env.TEST_GCP_STORAGE) {
+  console.log("TEST_GCP_STORAGE", process.env.TEST_GCP_STORAGE);
+  describe("GCP Storage", () => storageTests(GCSStorage));
+}
+
 function storageTests(StorageType: new (...args: any[]) => storageTypes.Storage, disablePersistence?: boolean) {
   var storage: storageTypes.Storage;
 
   before(() => {
     if (StorageType === AzureStorage) {
       storage = new StorageType(disablePersistence);
+    } else if (StorageType === GCSStorage) {
+      storage = new StorageType();
     }
   });
 
@@ -40,10 +48,10 @@ function storageTests(StorageType: new (...args: any[]) => storageTypes.Storage,
   });
 
   describe("Storage management", () => {
-    it("should be healthy if and only if running Azure storage", () => {
+    it("should be healthy if and only if running Azure or GCP storage", () => {
       return storage.checkHealth().then(
         /*returnedHealthy*/ () => {
-          assert.equal(StorageType, AzureStorage, "Should only return healthy if running Azure storage");
+          assert(StorageType === AzureStorage || StorageType === GCSStorage, "Should only return healthy if running Azure or GCP storage");
         },
         /*returnedUnhealthy*/ () => {
           assert.equal(StorageType, JsonStorage, "Should only return unhealthy if running JSON storage");
@@ -63,6 +71,31 @@ function storageTests(StorageType: new (...args: any[]) => storageTypes.Storage,
                 return azureStorage.reinitialize(process.env.AZURE_STORAGE_ACCOUNT, process.env.AZURE_STORAGE_ACCESS_KEY);
               } else {
                 return azureStorage.reinitialize();
+              }
+            }
+          )
+          .then(() => {
+            return storage.checkHealth(); // Fails test if unhealthy
+          });
+      });
+    }
+
+    if (StorageType === GCSStorage) {
+      it("should allow reconfiguring of GCP storage credentials", () => {
+        var gcsStorage: GCSStorage = <GCSStorage>storage;
+        return gcsStorage
+          .reinitialize("wrong-project-id", "wrong-key-file", "wrong-bucket")
+          .then(
+            failOnCallSucceeded,
+            /*returnedUnhealthy*/ () => {
+              if (process.env.GOOGLE_CLOUD_PROJECT_ID && process.env.GOOGLE_CLOUD_STORAGE_BUCKET) {
+                return gcsStorage.reinitialize(
+                  process.env.GOOGLE_CLOUD_PROJECT_ID,
+                  process.env.GOOGLE_CLOUD_KEY_FILE,
+                  process.env.GOOGLE_CLOUD_STORAGE_BUCKET
+                );
+              } else {
+                return gcsStorage.reinitialize();
               }
             }
           )
@@ -1105,6 +1138,17 @@ function storageTests(StorageType: new (...args: any[]) => storageTypes.Storage,
         assert.throws(() => {
           storage.getPackageHistoryFromDeploymentKey("possible injection attempt");
         });
+      });
+    }
+
+    if (storage instanceof GCSStorage) {
+      it("properly handles deployment key validation", () => {
+        // GCS storage uses hashed deployment keys and proper validation
+        // This test ensures that invalid deployment keys are handled gracefully
+        return storage.getPackageHistoryFromDeploymentKey("invalid-deployment-key")
+          .then(failOnCallSucceeded, (error: storageTypes.StorageError) => {
+            assert.equal(error.code, storageTypes.ErrorCode.NotFound);
+          });
       });
     }
 
