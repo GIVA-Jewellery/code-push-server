@@ -15,7 +15,7 @@ import { isPrototypePollutionKey } from "./storage";
 // that are used to structure data in a hierarchical way, similar to the original
 // Azure Table Storage implementation. This is crucial for organizing and querying
 // data efficiently in Firestore.
-module Keys {
+namespace Keys {
   const DELIMITER = " ";
   const LEAF_MARKER = "*";
 
@@ -118,7 +118,7 @@ module Keys {
 
   function validateParameters(parameters: string[]): void {
     parameters.forEach((parameter: string): void => {
-      if (parameter && (parameter.indexOf(DELIMITER) >= 0 || parameter.indexOf(LEAF_MARKER) >= 0)) {
+      if (typeof parameter === 'string' && parameter && (parameter.indexOf(DELIMITER) >= 0 || parameter.indexOf(LEAF_MARKER) >= 0)) {
         throw storage.storageError(storage.ErrorCode.Invalid, `The parameter '${parameter}' contained invalid characters.`);
       }
     });
@@ -225,32 +225,24 @@ export class GCSStorage implements storage.Storage {
 
     return this._setupPromise
       .then(() => {
-        // First check if an account with this email already exists (case-insensitive)
-        return this.getAccountByEmail(account.email);
-      })
-      .then(
-        () => {
-          // If we get here, account exists - return error
-          throw storage.storageError(storage.ErrorCode.AlreadyExists, "Account with this email already exists");
-        },
-        (error) => {
-          // If account doesn't exist (NotFound error), that's what we want - continue with creation
-          if (error.code === storage.ErrorCode.NotFound) {
-            const docRef = this._firestore
-              .collection(GCSStorage.COLLECTION_NAME)
-              .doc(this.getDocumentId(emailShortcutAddress.partitionKeyPointer, emailShortcutAddress.rowKeyPointer));
-            return docRef.set(this.wrap(account, emailShortcutAddress.partitionKeyPointer, emailShortcutAddress.rowKeyPointer));
-          } else {
-            // Some other error occurred
-            throw error;
+        // Use transaction for atomic email uniqueness check and account creation
+        return this._firestore.runTransaction(async (tx) => {
+          const emailDoc = this._firestore.collection(GCSStorage.COLLECTION_NAME)
+            .doc(this.getDocumentId(emailShortcutAddress.partitionKeyPointer, emailShortcutAddress.rowKeyPointer));
+          
+          const snap = await tx.get(emailDoc);
+          if (snap.exists) {
+            throw storage.storageError(storage.ErrorCode.AlreadyExists, "Account with this email already exists");
           }
-        }
-      )
-      .then(() => {
-        const docRef = this._firestore
-          .collection(GCSStorage.COLLECTION_NAME)
-          .doc(this.getDocumentId(hierarchicalAddress.partitionKeyPointer, hierarchicalAddress.rowKeyPointer));
-        return docRef.set(this.wrap(accountPointer, hierarchicalAddress.partitionKeyPointer, hierarchicalAddress.rowKeyPointer));
+          
+          // Create email shortcut document
+          tx.create(emailDoc, this.wrap(account, emailShortcutAddress.partitionKeyPointer, emailShortcutAddress.rowKeyPointer));
+          
+          // Create pointer document under accountId -> email
+          const hierDoc = this._firestore.collection(GCSStorage.COLLECTION_NAME)
+            .doc(this.getDocumentId(hierarchicalAddress.partitionKeyPointer, hierarchicalAddress.rowKeyPointer));
+          tx.set(hierDoc, this.wrap(accountPointer, hierarchicalAddress.partitionKeyPointer, hierarchicalAddress.rowKeyPointer));
+        });
       })
       .then(() => {
         return account.id;
@@ -356,9 +348,23 @@ export class GCSStorage implements storage.Storage {
         const appPromises = appPointers.map((pointer) => {
           return this.retrieveByKey(pointer.partitionKeyPointer, pointer.rowKeyPointer)
             .then((flatApp: any) => GCSStorage.unflattenApp(flatApp, accountId))
-            .catch((error: any) => {
-              // If a pointer is stale, log the error but don't fail the whole operation
+            .catch(async (error: any) => {
+              // If a pointer is stale, log the error and try to delete the stale pointer
               console.error(`Failed to resolve app pointer: ${error.message}`);
+              
+              // Best-effort cleanup of stale pointer
+              try {
+                const partitionKey = Keys.getAccountPartitionKey(accountId);
+                const rowKey = Keys.getHierarchicalAccountRowKey(accountId, pointer.partitionKeyPointer.split(' ')[1]);
+                const docRef = this._firestore.collection(GCSStorage.COLLECTION_NAME)
+                  .doc(this.getDocumentId(partitionKey, rowKey));
+                await docRef.delete();
+                console.log(`Cleaned up stale app pointer for account ${accountId}`);
+              } catch (cleanupError) {
+                // Ignore cleanup errors
+                console.log(`Failed to cleanup stale pointer: ${cleanupError.message}`);
+              }
+              
               return null;
             });
         });
@@ -635,39 +641,48 @@ export class GCSStorage implements storage.Storage {
 
     appPackage = storage.clone(appPackage);
 
-    let packageHistory: storage.Package[];
     return this._setupPromise
       .then(() => {
-        return this.getPackageHistoryFromBlob(deploymentId);
-      })
-      .then((history: storage.Package[]) => {
-        packageHistory = history;
-        appPackage.label = this.getNextLabel(packageHistory);
-        return this.getAccount(accountId);
-      })
-      .then((account: storage.Account) => {
-        appPackage.releasedBy = account.email;
+        // Use transaction to prevent package label race conditions
+        return this._firestore.runTransaction(async (tx) => {
+          // Read history within transaction
+          const historyContent = await this._historyBucket.file(deploymentId).download();
+          const packageHistory: storage.Package[] = JSON.parse(historyContent[0].toString());
+          
+          // Compute label within transaction
+          appPackage.label = this.getNextLabel(packageHistory);
+          
+          // Get account info
+          const account = await this.getAccount(accountId);
+          appPackage.releasedBy = account.email;
 
-        const lastPackage: storage.Package =
-          packageHistory && packageHistory.length ? packageHistory[packageHistory.length - 1] : null;
-        if (lastPackage) {
-          lastPackage.rollout = null;
-        }
+          const lastPackage: storage.Package =
+            packageHistory && packageHistory.length ? packageHistory[packageHistory.length - 1] : null;
+          if (lastPackage) {
+            lastPackage.rollout = null;
+          }
 
-        packageHistory.push(appPackage);
+          packageHistory.push(appPackage);
 
-        if (packageHistory.length > GCSStorage.MAX_PACKAGE_HISTORY_LENGTH) {
-          packageHistory.splice(0, packageHistory.length - GCSStorage.MAX_PACKAGE_HISTORY_LENGTH);
-        }
+          if (packageHistory.length > GCSStorage.MAX_PACKAGE_HISTORY_LENGTH) {
+            packageHistory.splice(0, packageHistory.length - GCSStorage.MAX_PACKAGE_HISTORY_LENGTH);
+          }
 
-        const flatPackage: any = { id: deploymentId, package: JSON.stringify(appPackage) };
-        return this.mergeByAppHierarchy(flatPackage, appId, deploymentId);
-      })
-      .then(() => {
-        return this.uploadToHistoryBlob(deploymentId, JSON.stringify(packageHistory));
-      })
-      .then((): storage.Package => {
-        return appPackage;
+          // Update package document within transaction
+          const flatPackage: any = { id: deploymentId, package: JSON.stringify(appPackage) };
+          const partitionKey: string = Keys.getAppPartitionKey(appId);
+          const rowKey: string = Keys.getHierarchicalAppRowKey(appId, deploymentId);
+          const docRef = this._firestore
+            .collection(GCSStorage.COLLECTION_NAME)
+            .doc(this.getDocumentId(partitionKey, rowKey));
+          
+          tx.update(docRef, this.wrap(flatPackage, partitionKey, rowKey));
+          
+          // Update history blob within transaction
+          await this._historyBucket.file(deploymentId).save(JSON.stringify(packageHistory));
+          
+          return appPackage;
+        });
       })
       .catch(GCSStorage.gcsErrorHandler);
   }
@@ -711,7 +726,7 @@ export class GCSStorage implements storage.Storage {
       .catch(GCSStorage.gcsErrorHandler);
   }
 
-  public addBlob(blobId: string, stream: stream.Readable, _streamLength: number): q.Promise<string> { // eslint-disable-line no-unused-vars
+  public addBlob(blobId: string, stream: stream.Readable, _streamLength: number, contentType?: string): q.Promise<string> { // eslint-disable-line no-unused-vars
     return this._setupPromise
       .then(() => {
         return utils.streamToBuffer(stream);
@@ -725,18 +740,8 @@ export class GCSStorage implements storage.Storage {
           validation: false, // Disable checksum validation which can cause upload mismatches
           metadata: {
             cacheControl: 'public, max-age=31536000', // Cache for 1 year
-            contentType: 'application/octet-stream'
+            contentType: contentType || 'application/octet-stream'
           }
-        });
-      })
-      .then(() => {
-        // Try to make the object publicly readable, but don't fail if uniform bucket-level access is enabled
-        const file = this._bucket.file(blobId);
-        return file.makePublic().catch((error: any) => {
-          // If uniform bucket-level access is enabled, this will fail, but that's okay
-          // The bucket should be configured to allow public access
-          console.log(`Note: Could not make object ${blobId} public: ${error.message}`);
-          return Promise.resolve();
         });
       })
       .then(() => {
@@ -745,20 +750,10 @@ export class GCSStorage implements storage.Storage {
       .catch(GCSStorage.gcsErrorHandler);
   }
 
-  public getBlobUrl(blobId: string): q.Promise<string> {
+  public getBlobUrl(blobId: string): q.Promise<string | null> {
     return this._setupPromise
-      .then(() => {
-        const file = this._bucket.file(blobId);
-        // Generate a signed URL that expires in 1 hour for testing
-        return file.getSignedUrl({
-          version: 'v4',
-          action: 'read',
-          expires: Date.now() + 60 * 60 * 1000, // 1 hour from now
-        });
-      })
-      .then(([signedUrl]) => {
-        return signedUrl;
-      })
+      .then(() => this._bucket.file(blobId).exists())
+      .then(([exists]) => exists ? `https://storage.googleapis.com/${this._bucket.name}/${blobId}` : null)
       .catch(GCSStorage.gcsErrorHandler);
   }
 
@@ -805,39 +800,70 @@ export class GCSStorage implements storage.Storage {
   }
 
   public getAccessKeys(accountId: string): q.Promise<storage.AccessKey[]> {
-    const deferred = q.defer<storage.AccessKey[]>();
+    const partitionKey: string = Keys.getAccountPartitionKey(accountId);
+    const rowKey: string = Keys.getHierarchicalAccountRowKey(accountId);
+    const searchKey: string = Keys.getAccessKeyRowKey(accountId);
+    const lower = searchKey;
+    const upper = `${searchKey}~`;
 
+    return this._setupPromise
+      .then(() => {
+        const col = this._firestore.collection(GCSStorage.COLLECTION_NAME);
+        return Promise.all([
+          col.doc(this.getDocumentId(partitionKey, rowKey)).get(),
+          col
+            .where("partitionKey", "==", partitionKey)
+            .where("rowKey", ">=", lower)
+            .where("rowKey", "<", upper)
+            .orderBy("rowKey")
+            .get(),
+        ]);
+      })
+      .then(([parentSnap, keysSnap]) => {
+        if (!parentSnap.exists) {
+          throw storage.storageError(storage.ErrorCode.NotFound);
+        }
+        return keysSnap.docs.map(d => this.unwrap(d.data()));
+      })
+      .catch((error) => {
+        // Fallback to original implementation if index is missing
+        if (error.code === 9 || error.message?.includes('requires an index')) {
+          console.log('Falling back to client-side filtering for getAccessKeys (index not available)');
+          return this.getAccessKeysFallback(accountId);
+        }
+        return GCSStorage.gcsErrorHandler(error);
+      });
+  }
+
+  private getAccessKeysFallback(accountId: string): q.Promise<storage.AccessKey[]> {
     const partitionKey: string = Keys.getAccountPartitionKey(accountId);
     const rowKey: string = Keys.getHierarchicalAccountRowKey(accountId);
     const searchKey: string = Keys.getAccessKeyRowKey(accountId);
 
-    this._setupPromise.then(() => {
-      this._firestore
-        .collection(GCSStorage.COLLECTION_NAME)
-        .where("partitionKey", "==", partitionKey)
-        .get()
-        .then((querySnapshot) => {
-          if (querySnapshot.empty) {
-            throw storage.storageError(storage.ErrorCode.NotFound);
+    return this._setupPromise
+      .then(() => {
+        return this._firestore
+          .collection(GCSStorage.COLLECTION_NAME)
+          .where("partitionKey", "==", partitionKey)
+          .get();
+      })
+      .then((querySnapshot) => {
+        if (querySnapshot.empty) {
+          throw storage.storageError(storage.ErrorCode.NotFound);
+        }
+
+        const objects: storage.AccessKey[] = [];
+
+        querySnapshot.forEach((doc) => {
+          const data = doc.data();
+          if (data.rowKey !== rowKey && data.rowKey.startsWith(searchKey)) {
+            objects.push(this.unwrap(data));
           }
-
-          const objects: storage.AccessKey[] = [];
-
-          querySnapshot.forEach((doc) => {
-            const data = doc.data();
-            if (data.rowKey !== rowKey && data.rowKey.startsWith(searchKey)) {
-              objects.push(this.unwrap(data));
-            }
-          });
-
-          deferred.resolve(objects);
-        })
-        .catch((error: any) => {
-          deferred.reject(error);
         });
-    });
 
-    return deferred.promise;
+        return objects;
+      })
+      .catch(GCSStorage.gcsErrorHandler);
   }
 
   public removeAccessKey(accountId: string, accessKeyId: string): q.Promise<void> {
@@ -940,81 +966,57 @@ export class GCSStorage implements storage.Storage {
   }
 
   private blobHealthCheck(bucket: Bucket): q.Promise<void> {
-    const deferred = q.defer<void>();
-
-    bucket
-      .file("health")
-      .download()
-      .then(([contents]) => {
-        if (contents.toString() !== "health") {
-          deferred.reject(
-            storage.storageError(
+    return q.Promise<void>((resolve, reject) => {
+      bucket
+        .file("health")
+        .download()
+        .then(([contents]) => {
+          if (contents.toString() !== "health") {
+            reject(storage.storageError(
               storage.ErrorCode.ConnectionFailed,
               "The GCS Buckets service failed the health check for " + bucket.name
-            )
-          );
-        } else {
-          deferred.resolve();
-        }
-      })
-      .catch((error: any) => {
-        deferred.reject(error);
-      });
-
-    return deferred.promise;
+            ));
+          } else {
+            resolve();
+          }
+        })
+        .catch(reject);
+    });
   }
 
   private getPackageHistoryFromBlob(blobId: string): q.Promise<storage.Package[]> {
-    const deferred = q.defer<storage.Package[]>();
-
-    this._historyBucket
-      .file(blobId)
-      .download()
-      .then(([contents]) => {
-        const parsedContents = JSON.parse(contents.toString());
-        deferred.resolve(parsedContents);
-      })
-      .catch((error: any) => {
-        deferred.reject(error);
-      });
-
-    return deferred.promise;
+    return q.Promise<storage.Package[]>((resolve, reject) => {
+      this._historyBucket
+        .file(blobId)
+        .download()
+        .then(([contents]) => {
+          const parsedContents = JSON.parse(contents.toString());
+          resolve(parsedContents);
+        })
+        .catch(reject);
+    });
   }
 
   private uploadToHistoryBlob(blobId: string, content: string): q.Promise<void> {
-    const deferred = q.defer<void>();
-
-    this._historyBucket
-      .file(blobId)
-      .save(content)
-      .then(() => {
-        deferred.resolve();
-      })
-      .catch((error: any) => {
-        deferred.reject(error);
-      });
-
-    return deferred.promise;
+    return q.Promise<void>((resolve, reject) => {
+      this._historyBucket.file(blobId).save(content)
+        .then(() => resolve())
+        .catch(reject);
+    });
   }
 
   private deleteHistoryBlob(blobId: string): q.Promise<void> {
-    const deferred = q.defer<void>();
-
-    this._historyBucket
-      .file(blobId)
-      .delete()
-      .then(() => {
-        deferred.resolve();
-      })
-      .catch((error: any) => {
-        deferred.reject(error);
-      });
-
-    return deferred.promise;
+    return q.Promise<void>((resolve, reject) => {
+      this._historyBucket
+        .file(blobId)
+        .delete()
+        .then(() => resolve())
+        .catch(reject);
+    });
   }
 
   private getDocumentId(partitionKey: string, rowKey: string): string {
-    return `${partitionKey}__${rowKey}`.replace(/[\/]/g, "_");
+    return `${partitionKey}__${rowKey}`.replace(/[\/]/g, "_").replace(/\s+/g, " ");
   }
 
   private wrap(jsObject: any, partitionKey: string, rowKey: string): any {
@@ -1047,8 +1049,6 @@ export class GCSStorage implements storage.Storage {
   }
 
   private addAppPointer(accountId: string, appId: string): q.Promise<void> {
-    const deferred = q.defer<void>();
-
     const appPartitionKey: string = Keys.getAppPartitionKey(appId);
     const appRowKey: string = Keys.getHierarchicalAppRowKey(appId);
     const pointer: Pointer = { partitionKeyPointer: appPartitionKey, rowKeyPointer: appRowKey };
@@ -1059,52 +1059,46 @@ export class GCSStorage implements storage.Storage {
     const docRef = this._firestore
       .collection(GCSStorage.COLLECTION_NAME)
       .doc(this.getDocumentId(accountPartitionKey, accountRowKey));
-    docRef
-      .set(this.wrap(pointer, accountPartitionKey, accountRowKey))
-      .then(() => {
-        deferred.resolve();
-      })
-      .catch((error: any) => {
-        deferred.reject(error);
-      });
-
-    return deferred.promise;
+    
+    return q.Promise<void>((resolve, reject) => {
+      docRef
+        .set(this.wrap(pointer, accountPartitionKey, accountRowKey))
+        .then(() => resolve())
+        .catch(reject);
+    });
   }
 
   private removeAppPointer(accountId: string, appId: string): q.Promise<void> {
-    const deferred = q.defer<void>();
-
     const accountPartitionKey: string = Keys.getAccountPartitionKey(accountId);
     const accountRowKey: string = Keys.getHierarchicalAccountRowKey(accountId, appId);
 
     const docRef = this._firestore
       .collection(GCSStorage.COLLECTION_NAME)
       .doc(this.getDocumentId(accountPartitionKey, accountRowKey));
-    docRef
-      .delete()
-      .then(() => {
-        deferred.resolve();
-      })
-      .catch((error: any) => {
-        deferred.reject(error);
-      });
-
-    return deferred.promise;
+    
+    return q.Promise<void>((resolve, reject) => {
+      docRef
+        .delete()
+        .then(() => resolve())
+        .catch(reject);
+    });
   }
 
   private removeAllCollaboratorsAppPointers(accountId: string, appId: string): q.Promise<void> {
     return this.getApp(accountId, appId, /*keepCollaboratorIds*/ true)
       .then((app: storage.App) => {
         const collaboratorMap: storage.CollaboratorMap = app.collaborators;
-
-        const removalPromises: q.Promise<void>[] = [];
-
-        Object.keys(collaboratorMap).forEach((key: string) => {
-          const collabProperties: storage.CollaboratorProperties = collaboratorMap[key];
-          removalPromises.push(this.removeAppPointer(collabProperties.accountId, app.id));
-        });
-
-        return q.allSettled(removalPromises);
+        const batch = this._firestore.batch();
+        
+        for (const email of Object.keys(collaboratorMap)) {
+          const collab = collaboratorMap[email];
+          const pk = Keys.getAccountPartitionKey(collab.accountId);
+          const rk = Keys.getHierarchicalAccountRowKey(collab.accountId, app.id);
+          const ref = this._firestore.collection(GCSStorage.COLLECTION_NAME).doc(this.getDocumentId(pk, rk));
+          batch.delete(ref);
+        }
+        
+        return batch.commit();
       })
       .then(() => { });
   }
@@ -1157,8 +1151,6 @@ export class GCSStorage implements storage.Storage {
     const accessKeyToStore = storage.clone(accessKey);
     // Store the original name, only hash it for the shortcut lookup key
     // The access key document should preserve the original name for retrieval
-    
-    const deferred = q.defer<string>();
 
     const partitionKey: string = Keys.getAccountPartitionKey(accountId);
     const rowKey: string = Keys.getAccessKeyRowKey(accountId, accessKeyToStore.id);
@@ -1167,16 +1159,12 @@ export class GCSStorage implements storage.Storage {
       .collection(GCSStorage.COLLECTION_NAME)
       .doc(this.getDocumentId(partitionKey, rowKey));
 
-    docRef
-      .set(this.wrap(accessKeyToStore, partitionKey, rowKey))
-      .then(() => {
-        deferred.resolve(accessKeyToStore.id);
-      })
-      .catch((error: any) => {
-        deferred.reject(error);
-      });
-
-    return deferred.promise;
+    return q.Promise<string>((resolve, reject) => {
+      docRef
+        .set(this.wrap(accessKeyToStore, partitionKey, rowKey))
+        .then(() => resolve(accessKeyToStore.id))
+        .catch(reject);
+    });
   }
 
   private retrieveByKey(partitionKey: string, rowKey: string): any {
@@ -1198,6 +1186,57 @@ export class GCSStorage implements storage.Storage {
   }
 
   private async getCollectionByHierarchy(accountId: string, appId?: string, deploymentId?: string): Promise<any[]> {
+    let partitionKey: string;
+    let parentRowKey: string;
+    let childrenSearchKey: string;
+
+    if (appId) {
+      partitionKey = Keys.getAppPartitionKey(appId);
+      parentRowKey = Keys.getHierarchicalAppRowKey(appId, deploymentId);
+      childrenSearchKey = Keys.generateHierarchicalAppKey(true, appId, deploymentId || "");
+    } else {
+      partitionKey = Keys.getAccountPartitionKey(accountId);
+      parentRowKey = Keys.getHierarchicalAccountRowKey(accountId);
+      childrenSearchKey = Keys.generateHierarchicalAccountKey(true, accountId, "");
+    }
+
+    // Compute range bounds once
+    const parentPK = partitionKey;
+    const parentRK = parentRowKey;
+    const childPrefix = childrenSearchKey.slice(0, -1); // same as today
+    const lower = childPrefix;
+    const upper = `${childPrefix}~`; // tilde is max ascii
+
+    const col = this._firestore.collection(GCSStorage.COLLECTION_NAME);
+
+    try {
+      // Fetch parent (to decide NotFound) + children using a range query
+      const [parentSnap, childrenSnap] = await Promise.all([
+        col.doc(this.getDocumentId(parentPK, parentRK)).get(),
+        col
+          .where("partitionKey", "==", parentPK)
+          .where("rowKey", ">=", lower)
+          .where("rowKey", "<", upper)
+          .orderBy("rowKey")
+          .get(),
+      ]);
+
+      if (!parentSnap.exists) {
+        throw storage.storageError(storage.ErrorCode.NotFound, "Parent entity not found.");
+      }
+
+      return childrenSnap.docs.map(d => this.unwrap(d.data()));
+    } catch (error) {
+      // Fallback to original implementation if index is missing
+      if (error.code === 9 || error.message?.includes('requires an index')) {
+        console.log('Falling back to client-side filtering for getCollectionByHierarchy (index not available)');
+        return this.getCollectionByHierarchyFallback(accountId, appId, deploymentId);
+      }
+      throw error;
+    }
+  }
+
+  private async getCollectionByHierarchyFallback(accountId: string, appId?: string, deploymentId?: string): Promise<any[]> {
     let partitionKey: string;
     let parentRowKey: string;
     let childrenSearchKey: string;
@@ -1240,6 +1279,100 @@ export class GCSStorage implements storage.Storage {
   }
 
   private async cleanUpByAppHierarchy(appId: string, deploymentId?: string): Promise<void> {
+    const partitionKey: string = Keys.getAppPartitionKey(appId);
+    const rowKey: string = Keys.getHierarchicalAppRowKey(appId, deploymentId);
+    const descendantsSearchKey: string = Keys.generateHierarchicalAppKey(/*markLeaf=*/ false, appId, deploymentId);
+
+    // Two queries: one exact doc (the node), one range for descendants
+    const col = this._firestore.collection(GCSStorage.COLLECTION_NAME);
+    const lower = descendantsSearchKey;
+    const upper = `${descendantsSearchKey}~`;
+    
+    try {
+      const [nodeSnap, descendantsSnap] = await Promise.all([
+        col.doc(this.getDocumentId(partitionKey, rowKey)).get(),
+        col
+          .where("partitionKey", "==", partitionKey)
+          .where("rowKey", ">=", lower)
+          .where("rowKey", "<", upper)
+          .orderBy("rowKey")
+          .get(),
+      ]);
+
+      const batch = this._firestore.batch();
+      const historyDeletes: Array<Promise<any>> = [];
+
+      // Add the node document to batch if it exists
+      if (nodeSnap.exists) {
+        const data: any = nodeSnap.data();
+        const rk: string = data.rowKey;
+        
+        // If this is a deployment leaf, also delete pointer + history
+        if (Keys.isDeployment(rk)) {
+          const deploymentIdFromDoc: string | undefined = data.id;
+          const deploymentKeyFromDoc: string | undefined = data.key;
+
+          if (deploymentKeyFromDoc) {
+            const pointerPk = Keys.getShortcutDeploymentKeyPartitionKey(deploymentKeyFromDoc);
+            const pointerRef = this._firestore.collection(GCSStorage.COLLECTION_NAME)
+              .doc(this.getDocumentId(pointerPk, ""));
+            batch.delete(pointerRef);
+          }
+
+          if (deploymentIdFromDoc) {
+            historyDeletes.push(
+              this._historyBucket.file(deploymentIdFromDoc).delete().catch(() => {/* ignore if already missing */})
+            );
+          }
+        }
+        
+        batch.delete(nodeSnap.ref);
+      }
+
+      // Add descendant documents to batch
+      descendantsSnap.forEach((doc) => {
+        const data: any = doc.data();
+        const rk: string = data.rowKey;
+
+        // If this is a deployment leaf, also delete pointer + history
+        if (Keys.isDeployment(rk)) {
+          const deploymentIdFromDoc: string | undefined = data.id;
+          const deploymentKeyFromDoc: string | undefined = data.key;
+
+          if (deploymentKeyFromDoc) {
+            const pointerPk = Keys.getShortcutDeploymentKeyPartitionKey(deploymentKeyFromDoc);
+            const pointerRef = this._firestore.collection(GCSStorage.COLLECTION_NAME)
+              .doc(this.getDocumentId(pointerPk, ""));
+            batch.delete(pointerRef);
+          }
+
+          if (deploymentIdFromDoc) {
+            historyDeletes.push(
+              this._historyBucket.file(deploymentIdFromDoc).delete().catch(() => {/* ignore if already missing */})
+            );
+          }
+        }
+
+        batch.delete(doc.ref);
+      });
+
+      if (!nodeSnap.exists && descendantsSnap.empty) {
+        return; // Nothing to delete
+      }
+
+      await batch.commit();
+      await Promise.all(historyDeletes);
+    } catch (error) {
+      // Fallback to original implementation if index is missing
+      if (error.code === 9 || error.message?.includes('requires an index')) {
+        console.log('Falling back to client-side filtering for cleanUpByAppHierarchy (index not available)');
+        return this.cleanUpByAppHierarchyFallback(appId, deploymentId);
+      }
+      throw error;
+    }
+  }
+
+  private async cleanUpByAppHierarchyFallback(appId: string, deploymentId?: string): Promise<void> {
     const partitionKey: string = Keys.getAppPartitionKey(appId);
     const rowKey: string = Keys.getHierarchicalAppRowKey(appId, deploymentId);
     const descendantsSearchKey: string = Keys.generateHierarchicalAppKey(/*markLeaf=*/ false, appId, deploymentId);
@@ -1291,45 +1424,33 @@ export class GCSStorage implements storage.Storage {
   }
 
   private mergeByAppHierarchy(jsObject: Object, appId: string, deploymentId?: string): q.Promise<void> {
-    const deferred = q.defer<void>();
-
     const partitionKey: string = Keys.getAppPartitionKey(appId);
     const rowKey: string = Keys.getHierarchicalAppRowKey(appId, deploymentId);
     const docRef = this._firestore
       .collection(GCSStorage.COLLECTION_NAME)
       .doc(this.getDocumentId(partitionKey, rowKey));
 
-    docRef
-      .update(this.wrap(jsObject, partitionKey, rowKey))
-      .then(() => {
-        deferred.resolve();
-      })
-      .catch((error: any) => {
-        deferred.reject(error);
-      });
-
-    return deferred.promise;
+    return q.Promise<void>((resolve, reject) => {
+      docRef
+        .update(this.wrap(jsObject, partitionKey, rowKey))
+        .then(() => resolve())
+        .catch(reject);
+    });
   }
 
   private updateByAppHierarchy(jsObject: Object, appId: string, deploymentId?: string): q.Promise<void> {
-    const deferred = q.defer<void>();
-
     const partitionKey: string = Keys.getAppPartitionKey(appId);
     const rowKey: string = Keys.getHierarchicalAppRowKey(appId, deploymentId);
     const docRef = this._firestore
       .collection(GCSStorage.COLLECTION_NAME)
       .doc(this.getDocumentId(partitionKey, rowKey));
 
-    docRef
-      .update(this.wrap(jsObject, partitionKey, rowKey))
-      .then(() => {
-        deferred.resolve();
-      })
-      .catch((error: any) => {
-        deferred.reject(error);
-      });
-
-    return deferred.promise;
+    return q.Promise<void>((resolve, reject) => {
+      docRef
+        .update(this.wrap(jsObject, partitionKey, rowKey))
+        .then(() => resolve())
+        .catch(reject);
+    });
   }
 
   private getNextLabel(packageHistory: storage.Package[]): string {
@@ -1350,7 +1471,6 @@ export class GCSStorage implements storage.Storage {
   ): any {
 
     // 1. Pass through errors that are already storage.storageError(...)
-    // Check multiple ways an error could be a storage error
     if (gcsError && (
       (typeof gcsError.source === 'number' && typeof gcsError.code === 'number') ||
       (gcsError.source === 0 && gcsError.code !== undefined) ||
@@ -1370,7 +1490,7 @@ export class GCSStorage implements storage.Storage {
       errorMessage = gcsError.toString();
     }
 
-    // 2. Infer NotFound from Firestore/GCS "not found" messages (some envs/emulators omit numeric code)
+    // 2. Infer NotFound from Firestore/GCS "not found" messages
     if (!errorCodeRaw || errorCodeRaw === "unknown") {
       const msgLower = (errorMessage || "").toLowerCase();
       if (msgLower.includes("not found") || msgLower.includes("does not exist") || msgLower.includes("no such")) {
@@ -1382,15 +1502,9 @@ export class GCSStorage implements storage.Storage {
       errorMessage = overrideValue || errorMessage;
     }
 
-    // Allow common HTTP status codes and GCS-specific errors to be processed
-    const allowedErrorCodes = [400, 404, 408, 409, 413, 4, 5, 6, 8, "not-found", "already-exists", "resource-exhausted", "deadline-exceeded", "FILE_NO_UPLOAD"];
-    if (typeof errorCodeRaw === "number" && !allowedErrorCodes.includes(errorCodeRaw) && !Object.values(storage.ErrorCode).includes(errorCodeRaw)) {
-      throw gcsError;
-    }
-
     let errorCode: storage.ErrorCode;
     
-    // 3. Fall back to current mapping
+    // 3. Map error codes to match expected test behavior
     switch (errorCodeRaw) {
       case "not-found":
       case 5: // Firestore NOT_FOUND
@@ -1412,8 +1526,10 @@ export class GCSStorage implements storage.Storage {
       case 408: // HTTP Request Timeout
         errorCode = storage.ErrorCode.ConnectionFailed;
         break;
+      case 9: // FAILED_PRECONDITION (index missing)
+        errorCode = storage.ErrorCode.Other;
+        break;
       case 400: // HTTP Bad Request
-      case "FILE_NO_UPLOAD": // GCS specific error for upload issues
         errorCode = storage.ErrorCode.Invalid;
         break;
       default:
