@@ -1,0 +1,63 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Debug Storage Test - Remove Access Key",
+      "type": "node",
+      "request": "launch",
+      "program": "${workspaceFolder}/node_modules/.bin/mocha",
+      "args": [
+        "bin/test/storage.js",
+        "--grep",
+        "can remove an access key",
+        "--timeout",
+        "30000"
+      ],
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "GOOGLE_CLOUD_PROJECT_ID": "avnimetabase",
+        "GOOGLE_CLOUD_KEY_FILE": "/Users/naresh/dev/giva/code-push-server/api/avnimetabase-code-push.json",
+        "GOOGLE_CLOUD_STORAGE_BUCKET": "giva-code-push",
+        "GOOGLE_CLOUD_FIRESTORE_DATABASE": "code-push",
+        "TEST_GCP_STORAGE": "true"
+      },
+      "console": "integratedTerminal",
+      "internalConsoleOptions": "neverOpen",
+      "skipFiles": [
+        "<node_internals>/**"
+      ],
+      "sourceMaps": true,
+      "outFiles": [
+        "${workspaceFolder}/bin/**/*.js"
+      ]
+    },
+    {
+      "name": "Debug All Storage Tests",
+      "type": "node",
+      "request": "launch",
+      "program": "${workspaceFolder}/node_modules/.bin/mocha",
+      "args": [
+        "bin/test/storage.js",
+        "--timeout",
+        "30000"
+      ],
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "GOOGLE_CLOUD_PROJECT_ID": "avnimetabase",
+        "GOOGLE_CLOUD_KEY_FILE": "/Users/naresh/dev/giva/code-push-server/api/avnimetabase-code-push.json",
+        "GOOGLE_CLOUD_STORAGE_BUCKET": "giva-code-push",
+        "GOOGLE_CLOUD_FIRESTORE_DATABASE": "code-push",
+        "TEST_GCP_STORAGE": "true"
+      },
+      "console": "integratedTerminal",
+      "internalConsoleOptions": "neverOpen",
+      "skipFiles": [
+        "<node_internals>/**"
+      ],
+      "sourceMaps": true,
+      "outFiles": [
+        "${workspaceFolder}/bin/**/*.js"
+      ]
+    }
+  ]
+}

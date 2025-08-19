@@ -148,20 +148,54 @@ export function getStreamAndSizeForFile(path: string): Promise<FileProps> {
 
 export function retrieveStringContentsFromUrl(url: string): Promise<string> {
   var protocol: typeof http | typeof https = null;
+  var host: string;
+  var path: string;
+  
   if (url.indexOf("https://") === 0) {
     protocol = https;
-  } else {
+    const urlParts = url.substring(8).split('/');
+    host = urlParts[0];
+    path = '/' + urlParts.slice(1).join('/');
+  } else if (url.indexOf("http://") === 0) {
     protocol = http;
+    const urlParts = url.substring(7).split('/');
+    host = urlParts[0];
+    path = '/' + urlParts.slice(1).join('/');
+  } else {
+    // Assume it's a relative path
+    protocol = http;
+    host = '127.0.0.1';
+    path = url;
   }
 
+  // Convert localhost to 127.0.0.1 for better compatibility
+  if (host && host.includes('localhost')) {
+    host = host.replace(/localhost/g, '127.0.0.1');
+  }
+
+
+
   return Promise((resolve: (stringValue: string) => void) => {
+    // Parse host and port separately
+    let requestHost = host;
+    let requestPort = undefined;
+    
+    if (host.includes(':')) {
+      const [hostPart, portPart] = host.split(':');
+      requestHost = hostPart;
+      requestPort = parseInt(portPart, 10);
+    }
+    
     const requestOptions: https.RequestOptions = {
-      path: url,
+      host: requestHost,
+      port: requestPort,
+      path: path,
     };
     protocol
       .get(requestOptions, (response: http.IncomingMessage) => {
         if (response.statusCode !== 200) {
-          return null;
+          resolve(null);
+          return;
         }
 
         makeStringFromStream(response).then((contents: string) => {

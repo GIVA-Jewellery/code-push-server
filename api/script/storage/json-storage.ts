@@ -544,7 +544,14 @@ export class JsonStorage implements storage.Storage {
 
   public getBlobUrl(blobId: string): Promise<string> {
     return this.getBlobServer().then((server: http.Server) => {
-      return server.address() + "/" + blobId;
+      const address = server.address();
+      if (typeof address === 'string') {
+        return address + "/" + blobId;
+      } else if (address && typeof address === 'object') {
+        return `http://localhost:${address.port}/${blobId}`;
+      } else {
+        return `http://localhost:0/${blobId}`;
+      }
     });
   }
 

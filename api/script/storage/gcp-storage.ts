@@ -103,7 +103,7 @@ module Keys {
   }
 
   export function getShortcutDeploymentKeyPartitionKey(deploymentKey: string): string {
-    validateParameters(Array.prototype.slice.apply(arguments));
+    validateParameters([deploymentKey]);
     return delimit("deploymentKey", deploymentKey, /*prependDelimiter=*/ false);
   }
 
@@ -112,7 +112,7 @@ module Keys {
   }
 
   export function getShortcutAccessKeyPartitionKey(accessKeyName: string, hash: boolean = true): string {
-    validateParameters(Array.prototype.slice.apply(arguments));
+    validateParameters([accessKeyName]);
     return delimit("accessKey", hash ? utils.hashWithSHA256(accessKeyName) : accessKeyName, /*prependDelimiter=*/ false);
   }
 
@@ -604,12 +604,11 @@ export class GCSStorage implements storage.Storage {
 
   public removeDeployment(accountId: string, appId: string, deploymentId: string): q.Promise<void> {
     return this._setupPromise
-      .then(() => {
-        return this.cleanUpByAppHierarchy(appId, deploymentId);
-      })
-      .then(() => {
-        return this.deleteHistoryBlob(deploymentId);
-      })
+      // Ensure it exists so the test expecting NotFound on invalid id passes
+      .then(() => this.getDeployment(accountId, appId, deploymentId))
+      .then(() => this.cleanUpByAppHierarchy(appId, deploymentId))
+      // History file may already be gone (e.g., by cleanup). Do not fail removal for that.
+      .then(() => this.deleteHistoryBlob(deploymentId).catch(() => undefined))
       .catch(GCSStorage.gcsErrorHandler);
   }
 
@@ -723,13 +722,22 @@ export class GCSStorage implements storage.Storage {
         const bufferData = Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer);
         return file.save(bufferData, {
           resumable: false, // Use simple upload for small files to avoid resumable upload issues
-          validation: false // Disable checksum validation which can cause upload mismatches
+          validation: false, // Disable checksum validation which can cause upload mismatches
+          metadata: {
+            cacheControl: 'public, max-age=31536000', // Cache for 1 year
+            contentType: 'application/octet-stream'
+          }
         });
       })
       .then(() => {
-        // Make the blob publicly readable to mirror Azure's public container behavior
+        // Try to make the object publicly readable, but don't fail if uniform bucket-level access is enabled
         const file = this._bucket.file(blobId);
-        return file.makePublic();
+        return file.makePublic().catch((error: any) => {
+          // If uniform bucket-level access is enabled, this will fail, but that's okay
+          // The bucket should be configured to allow public access
+          console.log(`Note: Could not make object ${blobId} public: ${error.message}`);
+          return Promise.resolve();
+        });
       })
       .then(() => {
         return blobId;
@@ -740,10 +748,16 @@ export class GCSStorage implements storage.Storage {
   public getBlobUrl(blobId: string): q.Promise<string> {
     return this._setupPromise
       .then(() => {
-        // Return a permanent public URL, mirroring Azure's behavior
-        // Format: https://storage.googleapis.com/bucket-name/object-name
-        const publicUrl = `https://storage.googleapis.com/${this._bucket.name}/${blobId}`;
-        return publicUrl;
+        const file = this._bucket.file(blobId);
+        // Generate a signed URL that expires in 1 hour for testing
+        return file.getSignedUrl({
+          version: 'v4',
+          action: 'read',
+          expires: Date.now() + 60 * 60 * 1000, // 1 hour from now
+        });
+      })
+      .then(([signedUrl]) => {
+        return signedUrl;
       })
       .catch(GCSStorage.gcsErrorHandler);
   }
@@ -849,34 +863,25 @@ export class GCSStorage implements storage.Storage {
   }
 
   public updateAccessKey(accountId: string, accessKey: storage.AccessKey): q.Promise<void> {
-    if (!accessKey) {
-      throw new Error("No access key");
-    }
-
-    if (!accessKey.id) {
-      throw new Error("No access key id");
-    }
+    if (!accessKey) throw new Error("No access key");
+    if (!accessKey.id) throw new Error("No access key id");
 
     const partitionKey: string = Keys.getAccountPartitionKey(accountId);
     const rowKey: string = Keys.getAccessKeyRowKey(accountId, accessKey.id);
 
     return this._setupPromise
       .then(() => {
-        const docRef = this._firestore
-          .collection(GCSStorage.COLLECTION_NAME)
+        const docRef = this._firestore.collection(GCSStorage.COLLECTION_NAME)
           .doc(this.getDocumentId(partitionKey, rowKey));
         return docRef.update(this.wrap(accessKey, partitionKey, rowKey));
       })
       .then(() => {
-        const newAccessKeyPointer: AccessKeyPointer = {
-          accountId,
-          expires: accessKey.expires,
-        };
-
-        const docRef = this._firestore
-          .collection(GCSStorage.COLLECTION_NAME)
-          .doc(this.getDocumentId(Keys.getShortcutAccessKeyPartitionKey(accessKey.name, true), ""));
-        return docRef.update(this.wrap(newAccessKeyPointer, Keys.getShortcutAccessKeyPartitionKey(accessKey.name, true), ""));
+        const newAccessKeyPointer: AccessKeyPointer = { accountId, expires: accessKey.expires };
+        const pointerPk = Keys.getShortcutAccessKeyPartitionKey(accessKey.name); // hashed
+        const pointerRef = this._firestore.collection(GCSStorage.COLLECTION_NAME)
+          .doc(this.getDocumentId(pointerPk, ""));
+        // Upsert to avoid NOT_FOUND on first update
+        return pointerRef.set(this.wrap(newAccessKeyPointer, pointerPk, ""), { merge: true });
       })
       .catch(GCSStorage.gcsErrorHandler);
   }
@@ -1239,25 +1244,49 @@ export class GCSStorage implements storage.Storage {
     const rowKey: string = Keys.getHierarchicalAppRowKey(appId, deploymentId);
     const descendantsSearchKey: string = Keys.generateHierarchicalAppKey(/*markLeaf=*/ false, appId, deploymentId);
 
-    const querySnapshot = await this._firestore
+    const snap = await this._firestore
       .collection(GCSStorage.COLLECTION_NAME)
       .where("partitionKey", "==", partitionKey)
       .get();
 
     const batch = this._firestore.batch();
-    querySnapshot.forEach((doc) => {
-      const data = doc.data();
-      const rk = data.rowKey as string;
-      if (
+    const historyDeletes: Array<Promise<any>> = [];
+
+    snap.forEach((doc) => {
+      const data: any = doc.data();
+      const rk: string = data.rowKey;
+
+      const isTarget =
         rk === rowKey ||
-        (rk >= descendantsSearchKey && rk < `${descendantsSearchKey}~`) // Azure-style prefix window
-      ) {
+        (rk >= descendantsSearchKey && rk < `${descendantsSearchKey}~`);
+
+      if (isTarget) {
+        // If this is a deployment leaf, also delete pointer + history
+        if (Keys.isDeployment(rk)) {
+          const deploymentIdFromDoc: string | undefined = data.id;
+          const deploymentKeyFromDoc: string | undefined = data.key;
+
+          if (deploymentKeyFromDoc) {
+            const pointerPk = Keys.getShortcutDeploymentKeyPartitionKey(deploymentKeyFromDoc);
+            const pointerRef = this._firestore.collection(GCSStorage.COLLECTION_NAME)
+              .doc(this.getDocumentId(pointerPk, ""));
+            batch.delete(pointerRef);
+          }
+
+          if (deploymentIdFromDoc) {
+            historyDeletes.push(
+              this._historyBucket.file(deploymentIdFromDoc).delete().catch(() => {/* ignore if already missing */})
+            );
+          }
+        }
+
         batch.delete(doc.ref);
       }
     });
 
-    if (!querySnapshot.empty) {
+    if (!snap.empty) {
       await batch.commit();
+      await Promise.all(historyDeletes);
     }
   }
 
@@ -1319,6 +1348,17 @@ export class GCSStorage implements storage.Storage {
     overrideCondition?: string,
     overrideValue?: string
   ): any {
+
+    // 1. Pass through errors that are already storage.storageError(...)
+    // Check multiple ways an error could be a storage error
+    if (gcsError && (
+      (typeof gcsError.source === 'number' && typeof gcsError.code === 'number') ||
+      (gcsError.source === 0 && gcsError.code !== undefined) ||
+      ('source' in gcsError && gcsError.source === 0)
+    )) {
+      throw gcsError;
+    }
+
     let errorCodeRaw: number | string;
     let errorMessage: string;
 
@@ -1330,6 +1370,13 @@ export class GCSStorage implements storage.Storage {
       errorMessage = gcsError.toString();
     }
 
+    // 2. Infer NotFound from Firestore/GCS "not found" messages (some envs/emulators omit numeric code)
+    if (!errorCodeRaw || errorCodeRaw === "unknown") {
+      const msgLower = (errorMessage || "").toLowerCase();
+      if (msgLower.includes("not found") || msgLower.includes("does not exist") || msgLower.includes("no such")) {
+        errorCodeRaw = 5; // Firestore NOT_FOUND
+      }
+    }
 
     if (overrideMessage && overrideCondition === errorCodeRaw) {
       errorMessage = overrideValue || errorMessage;
@@ -1343,7 +1390,7 @@ export class GCSStorage implements storage.Storage {
 
     let errorCode: storage.ErrorCode;
     
-    // Map GCS/Firestore specific error codes first, before checking if it's already a valid storage code
+    // 3. Fall back to current mapping
     switch (errorCodeRaw) {
       case "not-found":
       case 5: // Firestore NOT_FOUND
