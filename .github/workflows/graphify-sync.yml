@@ -1,0 +1,172 @@
+name: Graphify knowledge graph (build + sync)
+
+# Lives in each TARGET repo. On a published release, builds the code knowledge
+# graph with Graphify (https://github.com/Graphify-Labs/graphify) and stores it
+# in TWO places (both via the Contents API, so branch-protection rules that
+# require PRs on the default branch are never hit):
+#   1. In the sherlock central queue (graphs/<this-repo>/graph.json on the
+#      `graphs` branch) -- the cross-repo index used for debugging + the chatbot.
+#   2. On a dedicated branch in THIS repo (.graphify/graph.json on
+#      `graphify-graph`), from which it opens a PR into the default branch so the
+#      committed copy lands on the default branch under branch-protection rules
+#      (a human merges it). Used by local development after merge.
+#
+# Extraction is tree-sitter AST only (deterministic, no LLM, no API cost).
+#
+# One-time setup (per target repo):
+#   vars.SHERLOCK_GRAPH_BRANCH   - branch in sherlock to push to (default: graphs)
+#   vars.GRAPHIFY_LOCAL_BRANCH   - in-repo branch for the local copy (default: graphify-graph)
+#   secrets.BOT_GITHUB_TOKEN     - fine-grained PAT with contents:write on the
+#                                  sherlock repo ONLY (least privilege).
+# One-time setup (in sherlock, once): create the orphan `graphs` branch so the
+# Contents API has a branch to write to:
+#   git switch --orphan graphs && git commit --allow-empty -m "init graphs" \
+#     && git push origin graphs
+# The in-repo `graphify-graph` branch is created automatically on first run.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:   # allow manual / backfill rebuilds
+  repository_dispatch: # on-demand rebuild triggered from sherlock (backfill)
+    types: [graph-rebuild]
+
+permissions:
+  contents: write        # create/update the graphify-graph branch + graph file
+  pull-requests: write   # open the PR from graphify-graph into the default branch
+
+concurrency:
+  group: graphify-${{ github.repository }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-sync:
+    runs-on: ${{ vars.AGENT_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 20
+    env:
+      REPO_NAME: ${{ github.event.repository.name }}
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      SHERLOCK_REPO: "GIVA-Jewellery/sherlock"
+      GRAPH_BRANCH: ${{ vars.SHERLOCK_GRAPH_BRANCH || 'graphs' }}
+    steps:
+      - name: Checkout (default branch, full history)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Graphify
+        # `graphify install` is only for AI-assistant integration; not needed in CI.
+        run: pip install graphifyy
+
+      - name: Build knowledge graph
+        run: |
+          set -euo pipefail
+          # Generates graphify-out/{graph.json,graph.html,cache/}.
+          # --code-only: index code via local AST only; skip docs/images that
+          # would otherwise require an LLM API key. Keeps this key-free.
+          graphify . --code-only
+          test -f graphify-out/graph.json
+
+      # Build a compact, key-free classifier profile from the graph (directory
+      # breakdown + entity labels), then base64-encode graph + profile (no
+      # newlines) for upload. `graphify .` does NOT emit GRAPH_REPORT.md (that
+      # needs a separate LLM step), so we derive our own profile deterministically.
+      - name: Build profile & encode
+        run: |
+          set -euo pipefail
+          G=graphify-out/graph.json
+          COMMIT="$(jq -r '.built_at_commit // "unknown"' "$G")"
+          NODES="$(jq -r '.nodes|length' "$G")"
+          LINKS="$(jq -r '.links|length' "$G")"
+          {
+            echo "# ${REPO_NAME} — code knowledge graph profile"
+            echo "commit: ${COMMIT}"
+            echo "nodes: ${NODES}, links: ${LINKS}"
+            echo
+            echo "## Directories (node count)"
+            jq -r '[.nodes[].source_file|select(.!=null)|split("/")|(if length>1 then .[0:2] else .[0:1] end)|join("/")] | reduce .[] as $d ({}; .[$d]+=1) | to_entries|sort_by(-.value)[]|"- \(.key): \(.value)"' "$G"
+            echo
+            echo "## Key entities (labels, up to 250)"
+            jq -r '[.nodes[].label|select(.!=null)]|unique|.[0:250][]|"- \(.)"' "$G"
+          } > graphify-out/profile.md
+          base64 -w0 "$G" | tr -d '\n' > graph.b64
+          base64 -w0 graphify-out/profile.md | tr -d '\n' > profile.b64
+
+      # 1) PRIMARY: push into the sherlock central queue (graphs branch) via the
+      #    Contents API -- no clone of sherlock needed. Runs first so the
+      #    cross-repo copy lands even if the local-copy step below fails.
+      #    Publishes both the full graph.json and the compact profile.md
+      #    (the latter feeds the repo-classifier in sherlock).
+      - name: Sync graph to sherlock
+        env:
+          GH_TOKEN: ${{ secrets.BOT_GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          put_file() {  # $1 = dest path under graphs/<repo>/, $2 = base64 file
+            local dest="graphs/${REPO_NAME}/$1"
+            local sha
+            sha="$(gh api "repos/${SHERLOCK_REPO}/contents/${dest}?ref=${GRAPH_BRANCH}" \
+                    --jq .sha 2>/dev/null || true)"
+            gh api --method PUT "repos/${SHERLOCK_REPO}/contents/${dest}" \
+              -f message="graphify: update ${REPO_NAME} ${1} from ${GITHUB_SHA}" \
+              -f branch="${GRAPH_BRANCH}" \
+              -F content=@"$2" \
+              ${sha:+-f sha="${sha}"}
+          }
+          put_file graph.json graph.b64
+          put_file profile.md profile.b64
+
+      # 2) Local copy for development: stage the graph on a dedicated in-repo
+      #    branch via the Contents API, then open a PR into the default branch so
+      #    it merges under branch-protection rules (a human is the merge gate).
+      #    The branch is RESET to the current default-branch HEAD each run so its
+      #    PR contains only the graph.json change and never drifts/reverts main.
+      - name: Publish local graph copy
+        continue-on-error: true   # optional; never fail the run on the local copy
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LOCAL_BRANCH: ${{ vars.GRAPHIFY_LOCAL_BRANCH || 'graphify-graph' }}
+        run: |
+          set -euo pipefail
+          REPO="${GITHUB_REPOSITORY}"
+          DEST=".graphify/graph.json"
+
+          # Point LOCAL_BRANCH at the current default-branch HEAD (create or reset).
+          BASE_SHA="$(gh api "repos/${REPO}/git/ref/heads/${DEFAULT_BRANCH}" --jq .object.sha)"
+          if gh api "repos/${REPO}/branches/${LOCAL_BRANCH}" >/dev/null 2>&1; then
+            gh api --method PATCH "repos/${REPO}/git/refs/heads/${LOCAL_BRANCH}" \
+              -f sha="${BASE_SHA}" -F force=true
+          else
+            gh api --method POST "repos/${REPO}/git/refs" \
+              -f ref="refs/heads/${LOCAL_BRANCH}" -f sha="${BASE_SHA}"
+          fi
+
+          # Write graph.json onto the branch (sha = its copy on the just-reset
+          # branch, i.e. whatever is on the default branch, if any).
+          SHA="$(gh api "repos/${REPO}/contents/${DEST}?ref=${LOCAL_BRANCH}" \
+                  --jq .sha 2>/dev/null || true)"
+          gh api --method PUT "repos/${REPO}/contents/${DEST}" \
+            -f message="chore(graphify): update code knowledge graph" \
+            -f branch="${LOCAL_BRANCH}" \
+            -F content=@graph.b64 \
+            ${SHA:+-f sha="${SHA}"}
+
+          # Open a PR into the default branch if one isn't already open. If there
+          # is no diff (graph unchanged), gh exits non-fatally.
+          OPEN="$(gh pr list --repo "${REPO}" --head "${LOCAL_BRANCH}" \
+                    --base "${DEFAULT_BRANCH}" --state open --json number --jq 'length')"
+          if [ "${OPEN}" -gt 0 ]; then
+            echo "PR from ${LOCAL_BRANCH} into ${DEFAULT_BRANCH} already open; branch updated."
+          else
+            gh pr create --repo "${REPO}" \
+              --base "${DEFAULT_BRANCH}" --head "${LOCAL_BRANCH}" \
+              --title "chore(graphify): update code knowledge graph" \
+              --body "Automated update of \`.graphify/graph.json\` (code knowledge graph), generated on release by the graphify-sync workflow. Review and merge to refresh the local graph on \`${DEFAULT_BRANCH}\`." \
+              || echo "No PR opened (likely no diff between ${LOCAL_BRANCH} and ${DEFAULT_BRANCH})."
+          fi
