@@ -1,0 +1,141 @@
+name: Claude Code (interactive)
+
+# Lives in each TARGET repo. Lets a human ask Claude to make changes directly
+# on an open PR by commenting "@claude <request>" -- distinct from
+# claude-pr-review.yml (automatic one-shot review, read-only) and
+# claude-debug.yml (bug-pipeline dispatch from the sherlock queue, no human
+# in the loop until PR review). This one is human-initiated, interactive, and
+# pushes commits straight to the PR branch.
+#
+# Explicitly builds the prompt (PR title/body, full comment thread, inline
+# review comments, current diff) rather than relying on the action's default
+# context-gathering, so the context included is visible/auditable here and
+# consistent with rca.yml / claude-debug.yml's approach elsewhere in this repo.
+#
+# Secrets: secrets.CLAUDE_CODE_OAUTH_TOKEN (same one claude-debug.yml /
+# claude-pr-review.yml already use -- no new secret needed).
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+  pull_request_review:
+    types: [submitted]
+
+jobs:
+  claude:
+    # issue_comment fires for both issues and PRs -- github.event.issue.pull_request
+    # only exists when the comment is actually on a PR, so this scopes to PRs only.
+    if: |
+      (
+        (github.event_name == 'issue_comment' && github.event.issue.pull_request && contains(github.event.comment.body, '@claude')) ||
+        (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
+        (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude'))
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      id-token: write   # required by anthropics/claude-code-action (OIDC)
+    steps:
+      - name: Resolve PR number
+        id: pr
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "issue_comment" ]; then
+            echo "number=${{ github.event.issue.number }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "number=${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Puts the real PR head branch checked out (not a detached ref) so a
+      # later `git push` lands back on the PR, not nowhere.
+      - name: Checkout PR branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh pr checkout "${{ steps.pr.outputs.number }}" --repo "${{ github.repository }}"
+
+      - name: Build context prompt
+        id: prep
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          # Untrusted human text -- kept in an env var, never interpolated
+          # directly into the shell script below.
+          TRIGGER_BODY: ${{ github.event.comment.body || github.event.review.body }}
+        run: |
+          set -euo pipefail
+          mkdir -p .agent-output
+
+          gh pr view "$PR_NUMBER" --repo "$REPO" --json title,body,url,headRefName > .agent-output/pr.json
+          PR_TITLE="$(jq -r '.title' .agent-output/pr.json)"
+          PR_BODY="$(jq -r '.body' .agent-output/pr.json)"
+          PR_URL="$(jq -r '.url' .agent-output/pr.json)"
+
+          # Top-level PR conversation comments (issue-comment style).
+          gh api "repos/$REPO/issues/$PR_NUMBER/comments" --paginate \
+            --jq '.[] | "### Comment by @" + .user.login + " (" + .created_at + ")\n" + .body + "\n"' \
+            > .agent-output/comments.md || true
+
+          # Inline (file/line) review comments.
+          gh api "repos/$REPO/pulls/$PR_NUMBER/comments" --paginate \
+            --jq '.[] | "### Review comment by @" + .user.login + " on " + .path + ":" + (.line // .original_line | tostring) + "\n" + .body + "\n"' \
+            > .agent-output/review_comments.md || true
+
+          # Current diff, so Claude sees exactly what's already changed.
+          gh pr diff "$PR_NUMBER" --repo "$REPO" > .agent-output/diff.patch || true
+
+          {
+            echo "You are Claude Code, asked to make a change on an OPEN pull"
+            echo "request. Read everything below before editing anything --"
+            echo "prior comments and review feedback may already answer"
+            echo "questions or constrain the approach."
+            echo ""
+            echo "PR_URL=$PR_URL"
+            echo ""
+            echo "## PR title"
+            echo "$PR_TITLE"
+            echo ""
+            echo "## PR body"
+            echo "$PR_BODY"
+            echo ""
+            echo "## Prior comments (chronological)"
+            if [ -s .agent-output/comments.md ]; then cat .agent-output/comments.md; else echo "(none)"; fi
+            echo ""
+            echo "## Prior inline review comments"
+            if [ -s .agent-output/review_comments.md ]; then cat .agent-output/review_comments.md; else echo "(none)"; fi
+            echo ""
+            echo "## Current diff"
+            echo '```diff'
+            cat .agent-output/diff.patch
+            echo '```'
+            echo ""
+            echo "## Latest request -- address this"
+            echo "$TRIGGER_BODY"
+            echo ""
+            echo "When done: commit and push to the existing PR branch"
+            echo "(already checked out). Do not open a new PR or force-push"
+            echo "over history other than your own new commit(s). Reply with a"
+            echo "brief PR comment summarizing what you changed and why."
+          } > .agent-output/prompt.md
+
+          {
+            echo 'prompt<<PROMPT_EOF'
+            cat .agent-output/prompt.md
+            echo 'PROMPT_EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: ${{ steps.prep.outputs.prompt }}
+          claude_args: |
+            --allowedTools "Read,Edit,Write,Glob,Grep,Bash"
