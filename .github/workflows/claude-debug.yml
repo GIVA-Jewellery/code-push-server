@@ -127,15 +127,37 @@ jobs:
           exit 1
 
       # Per-repo toolchain + dependency access so the agent can run the test
-      # suite. Add the setup your stack needs. Examples:
-      #   - Go:   actions/setup-go@v5 (go-version-file), then for PRIVATE modules:
-      #       go env -w GOPRIVATE=github.com/<org>/*
-      #       git config --global \
-      #         url."https://x-access-token:${{ secrets.BOT_GITHUB_TOKEN }}@github.com/".insteadOf \
-      #         "https://github.com/"
+      # suite. Go is handled generically below (gated on go.mod so it's a
+      # no-op for non-Go repos). Add further per-stack setup your repo needs.
+      # Examples:
       #   - Node: actions/setup-node@v4 + npm ci
       #   - Python: actions/setup-python@v5 + pip install
       # BOT_GITHUB_TOKEN must have read access to any private dependency repos.
+
+      - name: Set up Go
+        if: hashFiles('go.mod') != ''
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      # Every repo in this org shares the same private module namespace
+      # (github.com/giva-jewellery/*, e.g. protos-repository, go-commons).
+      # Without this, `go build`/`go test` can't fetch those over plain HTTPS
+      # and the agent silently can't run the test suite (it did fetch the repo
+      # itself via CONTEXT_TOKEN/checkout already -- this is specifically for
+      # its private *dependencies*). Override with vars.GOPRIVATE if a repo
+      # needs a different/additional private module prefix.
+      - name: Configure private Go module access
+        if: hashFiles('go.mod') != ''
+        env:
+          BOT_GITHUB_TOKEN: ${{ secrets.BOT_GITHUB_TOKEN }}
+          GOPRIVATE_PATTERN: ${{ vars.GOPRIVATE || 'github.com/giva-jewellery/*' }}
+        run: |
+          set -euo pipefail
+          go env -w GOPRIVATE="$GOPRIVATE_PATTERN"
+          git config --global \
+            url."https://x-access-token:${BOT_GITHUB_TOKEN}@github.com/".insteadOf \
+            "https://github.com/"
 
       - name: Build agent prompt
         id: prep
