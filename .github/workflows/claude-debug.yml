@@ -1,39 +1,37 @@
 name: Claude agent (fix)
 
-# Lives in each TARGET repo. Handles three shapes of work, distinguished by
-# which client_payload field is present:
-#   - fix-request        -> client_payload.rca: a bug's RCA was done centrally
-#                            in sherlock (rca.yml); implement it here.
-#   - feature-plan-request -> client_payload.plan_slice: a cross-repo feature
-#                            plan was designed centrally (plan.yml); implement
-#                            ONLY this repo's slice of it. The plan may span
-#                            several repos dispatched independently/in parallel
-#                            -- see plan_slice.depends_on for (informational
-#                            only, not enforced) ordering against sibling repos.
-#   - bug-report / feature-request (no rca / plan_slice) -> kept for backward
-#                            compatibility: investigate-then-fix from scratch,
-#                            by WORK_KIND.
-# Never auto-merges.
+# THIN CALLER STUB -- the actual agent logic is a reusable workflow that
+# lives centrally in sherlock, NOT here:
+#   GIVA-Jewellery/sherlock/.github/workflows/claude-debug.yml
+# This file only needs to change if THIS repo's dispatch types or per-repo
+# config knobs change. Every other change (prompt tweaks, new MCPs, bug
+# fixes in the agent's logic) takes effect the moment sherlock's reusable
+# workflow changes -- no redeploy to this repo, ever.
 #
-# Per-repo tuning knobs (set as repo Variables / Secrets, no YAML edits needed):
+# Pinned to @main: this repo always runs sherlock's LATEST agent logic. A bad
+# change to that reusable workflow affects this repo's very next run.
+#
+# REQUIRES (one-time, done by sherlock's admins, not per target repo):
+# sherlock's Settings -> Actions -> General -> Access must allow this org's
+# repos to use its reusable workflows, or the `uses:` call below fails.
+#
+# Per-repo tuning knobs (set as repo Variables / Secrets, no YAML edits needed
+# beyond this file):
+#   vars.AGENT_RUNNER     - self-hosted runner label (default: ubuntu-latest)
 #   vars.AGENT_BASE_REF   - branch to check out & branch off (default: repo default branch)
 #   vars.AGENT_TEST_CMD   - optional; a test command hint surfaced to the agent
+#   vars.GOPRIVATE        - optional; private Go module prefix override
+#   vars.SIGNOZ_URL / vars.NETBIRD_MANAGEMENT_URL - optional overrides
 #   secrets.CLAUDE_CODE_OAUTH_TOKEN - required, Claude Code auth
 #   secrets.DISPATCH_TOKEN - required, PAT with issues:write on the sherlock queue
 #                            repo (to comment + relabel back). Shared with the
 #                            dispatcher; must be visible to this repo (org secret).
 #   secrets.BOT_GITHUB_TOKEN - read token exposed to Claude for cross-repo context.
 #   secrets.MONGO_READONLY_URI / POSTGRES_READONLY_URI - optional read-only DB
-#     connection strings (ideally read-only users on a replica). Each enables a
-#     read-only MCP server for diagnosis. Remove the server you don't need.
+#     connection strings. Each enables a read-only MCP server for diagnosis.
 #   secrets.SIGNOZ_API_KEY - optional; enables SigNoz MCP (logs/traces/metrics).
-#   vars.SIGNOZ_URL - optional override; default https://signoz-v2.internal.givadiva.co
 #   secrets.PROD_GITHUB_ACTIONS_NETBIRD_SETUP_KEY - NetBird setup key. Required
 #     when POSTGRES_READONLY_URI or SIGNOZ_API_KEY is set (both behind VPN).
-#   vars.NETBIRD_MANAGEMENT_URL - optional override; default
-#     https://netbird.givadiva.co (self-hosted management server -- the
-#     netbird client defaults to NetBird Cloud (api.netbird.io) otherwise,
-#     which does not know about keys issued by our own server).
 
 on:
   repository_dispatch:
@@ -47,446 +45,32 @@ permissions:
   pull-requests: write
   id-token: write   # required by anthropics/claude-code-action (OIDC)
 
-concurrency:
-  group: claude-debug-${{ github.event.client_payload.source_issue_number }}
-  cancel-in-progress: false
+# Deliberately NO `concurrency:` block here -- the reusable workflow already
+# declares one on the same group name. Declaring it on BOTH the caller and
+# the called reusable workflow deadlocks ("Canceling since a deadlock was
+# detected for concurrency group ... between a top level workflow and
+# 'debug'") because the caller run holds the group while waiting on the job
+# that needs the same group to start. One declaration (in the reusable
+# workflow) is sufficient.
 
 jobs:
   debug:
-    # GitHub-hosted by default (has unzip/gh/git/node preinstalled). For repos
-    # that need a private toolchain/network, set the AGENT_RUNNER repo variable
-    # to a self-hosted runner label.
-    runs-on: ${{ vars.AGENT_RUNNER || 'ubuntu-latest' }}
-    timeout-minutes: 40
-    env:
-      SRC_ISSUE_URL: ${{ github.event.client_payload.source_issue_url }}
-      SRC_ISSUE_NUM: ${{ github.event.client_payload.source_issue_number }}
-      ISSUE_TITLE: ${{ github.event.client_payload.title }}
-      ISSUE_BODY: ${{ github.event.client_payload.body }}
-      # Central RCA (from a fix-request dispatch). When present, the agent
-      # implements it rather than investigating from scratch.
-      RCA: ${{ github.event.client_payload.rca }}
-      # This repo's slice of a central cross-repo feature plan (from a
-      # feature-plan-request dispatch). When present, takes priority over RCA
-      # and investigate-from-scratch -- see the branching in "Build agent prompt".
-      PLAN_SLICE: ${{ toJSON(github.event.client_payload.plan_slice) }}
-      # "bug" (default) or "feature" -- set by the dispatcher from the issue's
-      # type:<kind> label. Controls the agent's objective + branch prefix.
-      WORK_KIND: ${{ github.event.client_payload.kind || 'bug' }}
-      BASE_REF: ${{ vars.AGENT_BASE_REF || github.event.repository.default_branch }}
-      TEST_CMD: ${{ vars.AGENT_TEST_CMD }}
-    steps:
-      - name: Checkout target repo
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ env.BASE_REF }}
-          fetch-depth: 0
-
-      # Postgres + SigNoz sit behind NetBird. Connect before MCP init so those
-      # servers can reach internal hosts. Skips when neither is configured.
-      - name: Connect NetBird VPN
-        env:
-          NB_SETUP_KEY: ${{ secrets.PROD_GITHUB_ACTIONS_NETBIRD_SETUP_KEY }}
-          POSTGRES_READONLY_URI: ${{ secrets.POSTGRES_READONLY_URI }}
-          SIGNOZ_API_KEY: ${{ secrets.SIGNOZ_API_KEY }}
-          NETBIRD_MANAGEMENT_URL: ${{ vars.NETBIRD_MANAGEMENT_URL || 'https://netbird.givadiva.co' }}
-        run: |
-          set -euo pipefail
-          NEED_VPN=0
-          [ -n "${POSTGRES_READONLY_URI:-}" ] && NEED_VPN=1
-          [ -n "${SIGNOZ_API_KEY:-}" ] && NEED_VPN=1
-          if [ "$NEED_VPN" -eq 0 ]; then
-            echo "No Postgres/SigNoz MCP configured — skipping NetBird."
-            exit 0
-          fi
-          if [ -z "${NB_SETUP_KEY:-}" ]; then
-            echo "::error::Postgres/SigNoz MCP needs PROD_GITHUB_ACTIONS_NETBIRD_SETUP_KEY (VPN)"
-            exit 1
-          fi
-
-          curl -fsSL https://pkgs.netbird.io/install.sh | sh
-          HOSTNAME="gha-claude-debug-${GITHUB_REPOSITORY_ID}-${GITHUB_RUN_ID}"
-          sudo netbird up \
-            --management-url "$NETBIRD_MANAGEMENT_URL" \
-            --setup-key "$NB_SETUP_KEY" \
-            --hostname "$HOSTNAME"
-
-          # Wait until management is up (peers / routes need a moment).
-          for i in $(seq 1 36); do
-            if sudo netbird status 2>/dev/null | grep -q 'Management: Connected'; then
-              echo "NetBird connected as $HOSTNAME"
-              sudo netbird status
-              exit 0
-            fi
-            echo "Waiting for NetBird… ($i/36)"
-            sleep 5
-          done
-          echo "::error::NetBird did not reach Management: Connected within 3m"
-          sudo netbird status || true
-          sudo cat /var/log/netbird/client.log 2>/dev/null | tail -n 80 || true
-          exit 1
-
-      # Per-repo toolchain + dependency access so the agent can run the test
-      # suite. Add the setup your stack needs. Examples:
-      #   - Go:   actions/setup-go@v5 (go-version-file), then for PRIVATE modules:
-      #       go env -w GOPRIVATE=github.com/<org>/*
-      #       git config --global \
-      #         url."https://x-access-token:${{ secrets.BOT_GITHUB_TOKEN }}@github.com/".insteadOf \
-      #         "https://github.com/"
-      #   - Node: actions/setup-node@v4 + npm ci
-      #   - Python: actions/setup-python@v5 + pip install
-      # BOT_GITHUB_TOKEN must have read access to any private dependency repos.
-
-      - name: Build agent prompt
-        id: prep
-        env:
-          # Reads the source issue's comments from the sherlock queue repo.
-          GH_TOKEN: ${{ secrets.DISPATCH_TOKEN }}
-          # Classic PAT (repo scope) -- REQUIRED to download user-attachments
-          # images. Fine-grained PATs (DISPATCH_TOKEN) get 404 on those assets.
-          IMAGE_TOKEN: ${{ secrets.BOT_GITHUB_TOKEN }}
-          # Read-only DB URIs / SigNoz key baked into the MCP config below (if set).
-          MONGO_READONLY_URI: ${{ secrets.MONGO_READONLY_URI }}
-          POSTGRES_READONLY_URI: ${{ secrets.POSTGRES_READONLY_URI }}
-          SIGNOZ_API_KEY: ${{ secrets.SIGNOZ_API_KEY }}
-          SIGNOZ_URL: ${{ vars.SIGNOZ_URL || 'https://signoz-v2.internal.givadiva.co' }}
-        run: |
-          set -euo pipefail
-          mkdir -p .agent-output
-          # feature work branches as feat/..., bug work as fix/...
-          if [ "${WORK_KIND:-bug}" = "feature" ]; then PREFIX="feat"; else PREFIX="fix"; fi
-          BRANCH="${PREFIX}/agent-issue-${SRC_ISSUE_NUM}"
-          echo "AGENT_BRANCH=$BRANCH" >> "$GITHUB_ENV"
-
-          # Fetch human analysis added as comments on the source issue (may be
-          # added after dispatch, so we read them live at debug time).
-          QUEUE_PATH="${SRC_ISSUE_URL#https://github.com/}"
-          QUEUE_REPO="${QUEUE_PATH%/issues/*}"
-          gh api "repos/$QUEUE_REPO/issues/$SRC_ISSUE_NUM/comments" \
-            --jq '.[] | "### Comment by @" + .user.login + "\n" + .body + "\n"' \
-            > .agent-output/comments.md || true
-
-          # Download any images referenced in the bug body + comments so Claude
-          # can view screenshots as visual evidence (its Read tool renders images).
-          # user-attachments assets only download with a CLASSIC repo-scoped PAT
-          # (IMAGE_TOKEN=BOT_GITHUB_TOKEN); GitHub 302-redirects to a signed URL
-          # and curl drops the Authorization header across hosts, as expected.
-          mkdir -p .agent-output/images
-          {
-            printf '%s\n' "${ISSUE_BODY:-}"
-            cat .agent-output/comments.md 2>/dev/null || true
-          } > .agent-output/all_text.md
-          grep -oiE \
-            -e '!\[[^]]*\]\([^)]+\)' \
-            -e '<img[^>]+src="[^"]+"' \
-            -e 'https://github\.com/user-attachments/assets/[A-Za-z0-9._-]+' \
-            -e 'https://user-images\.githubusercontent\.com/[^ )"<>]+' \
-            -e 'https://github\.com/[^ )"<>]+/assets/[A-Za-z0-9._-]+' \
-            -e 'https?://[^ )"<>]+\.(png|jpe?g|gif|webp)' \
-            .agent-output/all_text.md 2>/dev/null \
-            | grep -oE 'https?://[^ )"<>]+' | sort -u > .agent-output/image_urls.txt || true
-          i=0
-          while IFS= read -r url; do
-            [ -z "$url" ] && continue
-            i=$((i+1)); out=".agent-output/images/img-${i}"
-            curl -sSL --max-time 30 -H "Authorization: token ${IMAGE_TOKEN:-$GH_TOKEN}" \
-              -H "Accept: application/octet-stream" "$url" -o "$out" 2>/dev/null || { rm -f "$out"; continue; }
-            case "$(file -b --mime-type "$out" 2>/dev/null || echo x)" in
-              image/png)  mv "$out" "${out}.png" ;;
-              image/jpeg) mv "$out" "${out}.jpg" ;;
-              image/gif)  mv "$out" "${out}.gif" ;;
-              image/webp) mv "$out" "${out}.webp" ;;
-              *) rm -f "$out" ;;   # not an image (video/html/etc.) -> drop
-            esac
-          done < .agent-output/image_urls.txt
-          ls .agent-output/images/* >/dev/null 2>&1 && IMG_FOUND=1 || IMG_FOUND=0
-
-          # Objective + approach. A feature-plan-request's plan_slice takes
-          # priority (this repo's scope was already decided centrally); then a
-          # fix-request's RCA; otherwise fall back to investigate-then-fix by kind.
-          # (toJSON of an absent field renders the literal string "null", not
-          # empty -- guard against that explicitly.)
-          if [ -n "${PLAN_SLICE:-}" ] && [ "${PLAN_SLICE}" != "null" ]; then
-            OBJECTIVE="A cross-repo feature plan was designed centrally. Implement THIS repository's slice of it. Work autonomously."
-            cat > .agent-output/approach.md <<'A'
-          - The plan slice in "## Plan slice (your spec)" below is your scope for
-            THIS repo ONLY. Do not implement work that belongs to another repo
-            (see its "depends_on"/notes) -- if this repo's slice genuinely cannot
-            be completed without a change landing in a dependency repo first
-            (e.g. an API/field it needs doesn't exist yet), say so explicitly in
-            notes.md / the PR body rather than guessing at that repo's future
-            shape. Dispatches to sibling repos happen independently/in parallel,
-            nothing sequences them, so a human reviewer is the one who checks
-            dependency order before merging.
-          - Restate concrete acceptance criteria for THIS repo's slice before coding.
-          - Design the SMALLEST implementation that satisfies the slice and matches
-            the existing patterns/conventions in this codebase. Do not over-engineer
-            or add scope that was not requested (including scope that belongs to a
-            sibling repo).
-          - Add tests that cover the new behaviour. Update docs / README / config
-            samples where this change makes them stale.
-          - If the slice is ambiguous or needs a large/risky design decision: DO NOT
-            guess. Write your questions and proposed options to .agent-output/notes.md
-            and stop (no PR).
-          A
-          elif [ -n "${RCA:-}" ]; then
-            OBJECTIVE="A root-cause analysis was done centrally. Implement the fix it specifies in THIS repository. Work autonomously."
-            cat > .agent-output/approach.md <<'A'
-          - The RCA in "## RCA (root cause + fix plan)" below is your spec. Apply
-            the change it names, at the file(s)/lines it names. Keep it minimal.
-          - Verify the RCA matches the actual code before editing. If it does NOT
-            fit (files/symbols differ, or it looks wrong), DO NOT force it -- write
-            what you found to .agent-output/notes.md and stop (no PR).
-          - Add or update a test covering the fix.
-          A
-          elif [ "${WORK_KIND:-bug}" = "feature" ]; then
-            OBJECTIVE="You are implementing a requested FEATURE / enhancement in THIS repository. Work autonomously."
-            cat > .agent-output/approach.md <<'A'
-          - Restate the requirement and concrete acceptance criteria BEFORE coding.
-          - Design the SMALLEST implementation that satisfies the requirement and
-            matches the existing patterns/conventions in this codebase. Do not
-            over-engineer or add scope that was not requested.
-          - Add tests that cover the new behaviour. Update docs / README / config
-            samples where this change makes them stale.
-          - If the requirement is ambiguous, underspecified, or needs a large or
-            risky design decision: DO NOT guess. Write your questions and proposed
-            options to .agent-output/notes.md and stop (no PR).
-          A
-          else
-            OBJECTIVE="You are debugging a reported BUG in THIS repository. Work autonomously."
-            cat > .agent-output/approach.md <<'A'
-          - State a root-cause hypothesis BEFORE editing anything.
-          - Make the smallest fix that addresses the root cause. Add or update a
-            regression test that fails before the fix and passes after.
-          A
-          fi
-
-          {
-            echo "$OBJECTIVE"
-            echo ""
-            echo "Rules:"
-            cat <<'SHARED_TOP'
-          - First read CLAUDE.md in this repo for architecture, test commands, and
-            the do-not-touch list. Respect the do-not-touch list absolutely.
-          - If read-only database MCP tools are available (mongodb / postgres),
-            use them to inspect data -- to reproduce the bug, or to understand
-            current behaviour for a feature. They are read-only -- never attempt
-            writes. Do not copy sensitive data into the PR, notes, or logs.
-          - If SigNoz MCP tools are available (mcp__signoz), use them to query
-            logs, traces, and metrics for the failing window. Prefer narrow time
-            ranges + service/error filters. Do not dump large log payloads into
-            the PR or notes -- summarize with counts, example trace IDs, and
-            file:line pointers.
-          - Read the "## Human analysis (issue comments)" section below. A human
-            triager may have added key context there (analysis of screenshots,
-            logs, or files they inspected). Treat it as first-class evidence.
-          - If the "## Attached images" section lists image files, use the Read
-            tool on each one -- they are screenshots from the reporter/triager
-            (error states, UI mockups, stack traces). Treat them as first-class
-            evidence alongside the text.
-          - If diagnosing needs OTHER repositories (a shared library, or a
-            backend/frontend counterpart), you have a READ-ONLY token in the
-            CONTEXT_TOKEN env var. Clone what you need, e.g.:
-              git clone --depth 1 https://x-access-token:$CONTEXT_TOKEN@github.com/<org>/<repo> /tmp/<repo>
-            Context repos are READ-ONLY -- read them for context, but never push
-            or open PRs there. The fix (if any) belongs in THIS repo only.
-          SHARED_TOP
-            cat .agent-output/approach.md
-            cat <<'SHARED_BOTTOM'
-          - This is a ONE-SHOT run: there is no later turn, no task-notification,
-            and nothing will resume you after this run ends. Never background a
-            command (tests, builds, long scripts) and end your turn expecting to
-            "continue once it finishes" -- that moment never comes and the run
-            simply ends with nothing reported. Run tests/builds in the
-            foreground and wait for them synchronously.
-          - Run the test suite if you can. Running tests is best-effort, NOT mandatory:
-              * If tests run and FAIL, do not open a PR -- bail to notes.
-              * If the environment cannot run tests (missing deps, credentials,
-                private modules, etc.), that alone is NOT a reason to bail. You
-                may still open a PR, but the PR body MUST clearly state that tests
-                were not run and why, so a human runs them before merge.
-          - If you are confident in the change:
-              * create and switch to the branch named in AGENT_BRANCH (see below),
-              * commit the change, push the branch,
-              * open the PR targeting EXACTLY the base branch BASE_REF (see below) --
-                that is the branch you were checked out from / the repo default.
-                Do NOT pick a different base (e.g. never target `main` by guessing):
-                  gh pr create --base "<BASE_REF>" --head "<AGENT_BRANCH>" --title "..." --body "..."
-                The body must include "Addresses source issue: <SRC_ISSUE_URL>" and
-                note it is agent-generated.
-              * write the resulting PR URL to .agent-output/pr_url (one line, nothing else).
-          - If you are NOT confident (cannot reproduce, requirement unclear, change
-            is risky, touches the do-not-touch list, or tests actually FAIL): DO NOT
-            open a PR. Write .agent-output/notes.md and stop.
-          - Keep ALL written output CONCISE: notes.md and the PR body must be
-            short -- bullets, <= ~200 words, cite file:line instead of pasting
-            long code. State root cause, the fix, and what a human must check. No
-            long narrative, no duplicated code dumps.
-          SHARED_BOTTOM
-          } > .agent-output/prompt.md
-          {
-            echo ""
-            echo "AGENT_BRANCH=$BRANCH"
-            echo "BASE_REF=$BASE_REF"
-            echo "SRC_ISSUE_URL=$SRC_ISSUE_URL"
-            echo ""
-            case "${WORK_KIND:-bug}" in feature) KIND_LABEL="Feature";; *) KIND_LABEL="Bug";; esac
-            echo "## ${KIND_LABEL} title"
-            echo "$ISSUE_TITLE"
-            echo ""
-            echo "## ${KIND_LABEL} description"
-            echo "$ISSUE_BODY"
-            echo ""
-            if [ -n "${PLAN_SLICE:-}" ] && [ "${PLAN_SLICE}" != "null" ]; then
-              echo "## Plan slice (your spec -- THIS repo only)"
-              echo "Summary: $(printf '%s' "$PLAN_SLICE" | jq -r '.summary // "(none)"')"
-              echo "Depends on: $(printf '%s' "$PLAN_SLICE" | jq -r '(.depends_on // []) | if length==0 then "(none)" else join(", ") end')"
-              echo "Notes: $(printf '%s' "$PLAN_SLICE" | jq -r '.notes // "(none)"')"
-              echo ""
-            fi
-            if [ -n "${RCA:-}" ]; then
-              echo "## RCA (root cause + fix plan) -- your spec"
-              echo "$RCA"
-              echo ""
-            fi
-            echo "## Human analysis (issue comments)"
-            if [ -s .agent-output/comments.md ]; then cat .agent-output/comments.md; else echo "(no comments yet)"; fi
-            echo ""
-            echo "## Attached images"
-            if [ "${IMG_FOUND:-0}" = "1" ]; then
-              echo "Screenshots downloaded from the issue/comments. Read each file to view it:"
-              for f in .agent-output/images/*; do echo "- $f"; done
-            else
-              echo "(none)"
-            fi
-            [ -n "${TEST_CMD:-}" ] && { echo ""; echo "## Test command hint"; echo "$TEST_CMD"; }
-          } >> .agent-output/prompt.md
-
-          # Expose the prompt as a step output for the action below.
-          {
-            echo 'prompt<<PROMPT_EOF'
-            cat .agent-output/prompt.md
-            echo 'PROMPT_EOF'
-          } >> "$GITHUB_OUTPUT"
-
-          # MCP config for claude-code-action (passed via claude_args --mcp-config).
-          # Bake the REAL connection strings in via jq -- do NOT rely on the MCP
-          # runner expanding ${...} (it does not). Include only the servers whose
-          # URI secret is set, so an unconfigured server never hangs the run.
-          # The file lives on the ephemeral runner only; never commit/echo it.
-          MCP_JSON='{"mcpServers":{}}'
-          if [ -n "${MONGO_READONLY_URI:-}" ]; then
-            # Pre-install so the server isn't still downloading at MCP-init.
-            if npm install -g mongodb-mcp-server >/dev/null 2>&1; then
-              MDB_CMD=mongodb-mcp-server; MDB_ARGS='["--readOnly"]'
-            else
-              MDB_CMD=npx; MDB_ARGS='["-y","mongodb-mcp-server","--readOnly"]'
-            fi
-            MCP_JSON="$(printf '%s' "$MCP_JSON" | jq --arg uri "$MONGO_READONLY_URI" --arg cmd "$MDB_CMD" --argjson args "$MDB_ARGS" \
-              '.mcpServers.mongodb = {command:$cmd,args:$args,env:{MDB_MCP_CONNECTION_STRING:$uri}}')"
-          fi
-          if [ -n "${POSTGRES_READONLY_URI:-}" ]; then
-            # Pre-install so the server isn't still downloading at MCP-init
-            # ("still connecting" -> tools miss the agent's window), same as
-            # the mongo server above.
-            if npm install -g @modelcontextprotocol/server-postgres >/dev/null 2>&1; then
-              PG_CMD=mcp-server-postgres; PG_ARGS='[]'
-            else
-              PG_CMD=npx; PG_ARGS='["-y","@modelcontextprotocol/server-postgres"]'
-            fi
-            MCP_JSON="$(printf '%s' "$MCP_JSON" | jq --arg uri "$POSTGRES_READONLY_URI" --arg cmd "$PG_CMD" --argjson args "$PG_ARGS" \
-              '.mcpServers.postgres = {command:$cmd,args:($args + [$uri])}')"
-          fi
-          if [ -n "${SIGNOZ_API_KEY:-}" ]; then
-            # Official Go binary (stdio). Pre-download so MCP init isn't blocked
-            # on GitHub Releases. Pin arch to the GHA runner (linux/amd64).
-            # Best-effort: a transient GitHub Releases hiccup here must not
-            # fail the whole run (Mongo/Postgres MCP + the debug run itself
-            # don't need SigNoz) -- retry, then skip with a warning instead of
-            # exit 1.
-            mkdir -p .agent-output/bin
-            SIGNOZ_TARBALL_URL="https://github.com/SigNoz/signoz-mcp-server/releases/latest/download/signoz-mcp-server_linux_amd64.tar.gz"
-            SIGNOZ_BIN=""
-            for attempt in 1 2 3; do
-              if curl -fsSL --retry 2 --retry-delay 2 "$SIGNOZ_TARBALL_URL" -o .agent-output/signoz.tar.gz \
-                 && tar -xzf .agent-output/signoz.tar.gz -C .agent-output/bin; then
-                # The release tarball nests the binary (e.g.
-                # signoz-mcp-server_linux_amd64/bin/signoz-mcp-server) rather
-                # than extracting flat -- find it instead of hardcoding the path.
-                SIGNOZ_BIN="$(find .agent-output/bin -type f -name signoz-mcp-server | head -1)"
-                [ -n "$SIGNOZ_BIN" ] && break
-              fi
-              echo "::warning::SigNoz MCP download/extract attempt $attempt failed, retrying..."
-              rm -f .agent-output/signoz.tar.gz
-              sleep 5
-            done
-            if [ -n "$SIGNOZ_BIN" ]; then
-              chmod +x "$SIGNOZ_BIN"
-              SIGNOZ_URL="${SIGNOZ_URL:-https://signoz-v2.internal.givadiva.co}"
-              MCP_JSON="$(printf '%s' "$MCP_JSON" | jq \
-                --arg cmd "$PWD/$SIGNOZ_BIN" \
-                --arg url "$SIGNOZ_URL" \
-                --arg key "$SIGNOZ_API_KEY" \
-                '.mcpServers.signoz = {command:$cmd,args:[],env:{SIGNOZ_URL:$url,SIGNOZ_API_KEY:$key,LOG_LEVEL:"info"}}')"
-            else
-              echo "::warning::Could not fetch signoz-mcp-server after 3 attempts -- continuing without SigNoz MCP"
-            fi
-          fi
-          printf '%s\n' "$MCP_JSON" > .agent-output/mcp.json
-
-      - name: Run Claude Code
-        uses: anthropics/claude-code-action@v1
-        env:
-          # gh (used by Claude to push + open the PR) authenticates with this token.
-          GH_TOKEN: ${{ github.token }}
-          # Read-only cross-repo context available to Claude on demand.
-          CONTEXT_TOKEN: ${{ secrets.BOT_GITHUB_TOKEN }}
-          # Read-only DB / SigNoz creds, consumed by the MCP servers below.
-          # Keep only the ones this repo needs.
-          MONGO_READONLY_URI: ${{ secrets.MONGO_READONLY_URI }}
-          POSTGRES_READONLY_URI: ${{ secrets.POSTGRES_READONLY_URI }}
-          SIGNOZ_API_KEY: ${{ secrets.SIGNOZ_API_KEY }}
-          SIGNOZ_URL: ${{ vars.SIGNOZ_URL || 'https://signoz-v2.internal.givadiva.co' }}
-        with:
-          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          prompt: ${{ steps.prep.outputs.prompt }}
-          show_full_output: true   # surface Claude's full output in the run logs
-          # MCP servers (config written in the prep step). Autonomous debugging
-          # needs edit + shell (tests, git, gh) plus optional DB / SigNoz tools.
-          # Drop mcp__* entries for servers you did not configure.
-          claude_args: |
-            --mcp-config .agent-output/mcp.json
-            --allowedTools "Read,Edit,Write,Glob,Grep,Bash,mcp__mongodb,mcp__postgres,mcp__signoz"
-
-      - name: Report result back to queue
-        if: always()
-        env:
-          # Shared token: needs Issues:write on the sherlock queue repo.
-          GH_TOKEN: ${{ secrets.DISPATCH_TOKEN }}
-        run: |
-          set -euo pipefail
-          # Derive owner/repo of the central issue from its URL.
-          # e.g. https://github.com/org/sherlock/issues/42 -> org/sherlock
-          path="${SRC_ISSUE_URL#https://github.com/}"
-          QUEUE_REPO="${path%/issues/*}"
-
-          # Prefix with this repo's name -- with a feature plan fanned out to
-          # several repos, N of them report to the SAME central issue, so a
-          # human scanning the thread needs to tell them apart. Harmless for
-          # the single-repo bug flow too.
-          if [ -f .agent-output/pr_url ]; then
-            PR_URL="$(cat .agent-output/pr_url)"
-            printf 'Agent (`%s`) opened a PR: %s\n' "$GITHUB_REPOSITORY" "$PR_URL" > .agent-output/comment.md
-            NEW_LABEL="agent-pr-opened"
-          else
-            {
-              printf 'Agent (`%s`) did not open a PR. Notes:\n\n' "$GITHUB_REPOSITORY"
-              if [ -f .agent-output/notes.md ]; then cat .agent-output/notes.md; else echo '(no notes produced)'; fi
-            } > .agent-output/comment.md
-            NEW_LABEL="agent-stuck"
-          fi
-
-          gh issue comment "$SRC_ISSUE_NUM" --repo "$QUEUE_REPO" \
-            --body-file .agent-output/comment.md
-          gh issue edit "$SRC_ISSUE_NUM" --repo "$QUEUE_REPO" \
-            --remove-label agent-running --add-label "$NEW_LABEL" || true
+    uses: GIVA-Jewellery/sherlock/.github/workflows/claude-debug.yml@main
+    secrets: inherit
+    with:
+      source_issue_url: ${{ github.event.client_payload.source_issue_url }}
+      source_issue_number: ${{ github.event.client_payload.source_issue_number }}
+      title: ${{ github.event.client_payload.title }}
+      body: ${{ github.event.client_payload.body }}
+      rca: ${{ github.event.client_payload.rca }}
+      plan_slice_json: ${{ toJSON(github.event.client_payload.plan_slice) }}
+      work_kind: ${{ github.event.client_payload.kind || 'bug' }}
+      # GitHub-hosted by default (has unzip/gh/git/node preinstalled). For repos
+      # that need a private toolchain/network, set the AGENT_RUNNER repo variable
+      # to a self-hosted runner label.
+      runner: ${{ vars.AGENT_RUNNER || 'ubuntu-latest' }}
+      base_ref: ${{ vars.AGENT_BASE_REF || github.event.repository.default_branch }}
+      test_cmd: ${{ vars.AGENT_TEST_CMD }}
+      goprivate: ${{ vars.GOPRIVATE || 'github.com/giva-jewellery/*' }}
+      signoz_url: ${{ vars.SIGNOZ_URL || 'https://signoz-v2.internal.givadiva.co' }}
+      netbird_management_url: ${{ vars.NETBIRD_MANAGEMENT_URL || 'https://netbird.givadiva.co' }}
